@@ -30,10 +30,9 @@ SafeScreen includes four main components:
 ## Repository structure
 
 SafeScreen/
-├── code/
-│   ├── 01_deduplication.py
-│   ├── 02_title_abstract_screening.py
-│   ├── 03_full_text_ai_screening.py
-|
-├── LICENSE
-└── README.md
+code/
+    01_deduplication.py
+    02_title_abstract_screening.py
+    03_full_text_ai_screening.py
+LICENSE
+README.md
