@@ -1,0 +1,1627 @@
+# ============================================================
+#  SysRev Deduplicator — v3
+#
+#   - Year guard on title fuzzy: skip if both records have a year
+#    and they differ by more than 1 (cuts FP on unrelated papers
+#    with similar titles from different years)
+#  - Author guard on title/abstract fuzzy: skip if both records
+#    have a first author and they don't match (cuts FP on papers
+#    with same title by different authors)
+#  - Stronger completeness scoring: abstract and journal/vol/pages
+#    carry more weight so the "better" record is kept more
+# ============================================================
+
+# ── CELL 1 · Install ────────────────────────────────────────
+!pip -q install pandas rapidfuzz tqdm
+
+# ── CELL 2 · Mount Drive and set paths ────────────────────────
+import os
+from google.colab import drive
+
+DRIVE_ROOT = "/content/drive"
+if not os.path.ismount(DRIVE_ROOT):
+    drive.mount(DRIVE_ROOT)
+else:
+    print("Drive already mounted")
+
+# ▼▼▼  EDITABLE ▼▼▼
+OUT_DIR   = [PATH_REMOVED]
+INPUT_CSV = os.path.join(OUT_DIR, "r_articles_16159.csv")
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+OUT_DEDUP = os.path.join(OUT_DIR, "deduplicated.csv")
+OUT_DUPS  = os.path.join(OUT_DIR, "duplicates_removed.csv")
+OUT_PAIRS = os.path.join(OUT_DIR, "duplicate_pairs.csv")
+
+os.makedirs(OUT_DIR, exist_ok=True)
+print("INPUT exists:", os.path.exists(INPUT_CSV))
+
+# ── CELL 3 · Thresholds EDITABLE (edit here to tune) ─────────────────
+TITLE_THR      = 97    # token-sort-ratio threshold for title fuzzy match (0-100)
+ABS_THR        = 95    # character ratio threshold for abstract fuzzy match (0-100)
+ABS_MIN_LEN    = 150   # ignore abstracts shorter than this (chars)
+ABS_PREFIX_LEN = 80    # blocking prefix length for abstract grouping
+
+CHECK_DOI      = True
+CHECK_PMID     = True
+CHECK_ABSTRACT = True
+CHECK_TITLE    = True
+
+# ── Year / author guards on fuzzy matching ───────────────────
+# When both records have a year, skip the match if they differ
+# by more than this value. Set to None to disable.
+YEAR_TOLERANCE = 1     # allow ±1 year (handles preprint → journal)
+
+# When both records have a first author, require them to match.
+# Set to False to disable.
+AUTHOR_GUARD   = True
+
+# ── CELL 4 · Load & inspect ─────────────────────────────────
+import pandas as pd
+import numpy as np
+
+encodings_to_try = [
+    "utf-8-sig",
+    "utf-8",
+    "cp1252",
+    "latin1",
+    "ISO-8859-1"
+]
+
+df = None
+used_encoding = None
+
+for enc in encodings_to_try:
+    try:
+        df = pd.read_csv(INPUT_CSV, low_memory=False, encoding=enc)
+        used_encoding = enc
+        print(f"CSV loaded successfully with encoding: {enc}")
+        break
+    except UnicodeDecodeError as e:
+        print(f"Failed with encoding {enc}: {e}")
+
+if df is None:
+    raise ValueError("Could not read CSV with the tested encodings.")
+
+print(f"Shape: {df.shape}")
+print("Columns:", list(df.columns))
+df.head(3)
+
+# ── CELL 5 · Deduplication ──────────────────────────────────
+import re
+from rapidfuzz import fuzz
+from tqdm.auto import tqdm
+
+# ── helpers ──────────────────────────────────────────────────
+
+def norm_text(s):
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return ""
+    return re.sub(r"\s+", " ", str(s).lower().strip())
+
+def norm_title(s):
+    s = norm_text(s)
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", s)).strip()
+
+def norm_abstract(s):
+    s = norm_text(s)
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", s)).strip()
+
+def norm_doi(s):
+    s = norm_text(s)
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        s = s.replace(prefix, "")
+    m = re.search(r"(10\.\d{4,9}/\S+)", s)
+    return m.group(1).rstrip(" .);,") if m else ""
+
+def norm_pmid(s):
+    s = norm_text(s)
+    m = re.search(r"\b(\d{6,10})\b", s)
+    return m.group(1) if m else ""
+
+def norm_year(s):
+    s = norm_text(s)
+    m = re.search(r"\b(19|20)\d{2}\b", s)
+    return m.group(0) if m else ""
+
+def first_author_key(s):
+    s = norm_text(s)
+    if s.strip() in ("", "nan", "none"):
+        return ""
+    s = re.sub(r"[^a-z\s,;]", "", s)
+    parts = re.split(r"[,;]", s)
+    tokens = parts[0].strip().split()
+    return tokens[-1] if tokens else ""
+
+def find_col(df, keys):
+    lc = {c.lower(): c for c in df.columns}
+    for k in keys:
+        if k in lc:
+            return lc[k]
+    for c in df.columns:
+        if any(k in c.lower() for k in keys):
+            return c
+    return None
+
+def years_compatible(ya, yb):
+    """Return True if years are compatible (same, missing, or within tolerance)."""
+    if YEAR_TOLERANCE is None:
+        return True
+    if not ya or not yb:
+        return True   # one missing → don't penalise
+    try:
+        return abs(int(ya) - int(yb)) <= YEAR_TOLERANCE
+    except ValueError:
+        return True
+
+def authors_compatible(aa, ab):
+    """Return True if first-author keys are compatible."""
+    if not AUTHOR_GUARD:
+        return True
+    if not aa or not ab:
+        return True   # one missing → don't penalise
+    return aa == ab
+
+# ── detect columns ───────────────────────────────────────────
+
+title_col   = find_col(df, ["title"])
+doi_col     = find_col(df, ["doi"])
+pmid_col    = find_col(df, ["pmid", "pubmed_id", "pubmedid", "pubmed id"])
+pmc_col     = find_col(df, ["pmc_id", "pmcid", "pmc id"])
+year_col    = find_col(df, ["year", "publication_year", "pubyear"])
+auth_col    = find_col(df, ["authors", "author"])
+abs_col     = find_col(df, ["abstract", "abstract note", "abstract_note", "summary"])
+journal_col = find_col(df, ["journal", "source", "publication", "container-title"])
+pages_col   = find_col(df, ["pages", "page"])
+vol_col     = find_col(df, ["volume"])
+iss_col     = find_col(df, ["issue", "number"])
+
+print("\nDetected columns:")
+for name, col in [("title", title_col), ("doi", doi_col), ("pmid", pmid_col),
+                   ("pmcid", pmc_col), ("year", year_col), ("authors", auth_col),
+                   ("abstract", abs_col), ("journal", journal_col)]:
+    print(f"  {name:10s}: {col}")
+
+if title_col is None:
+    raise ValueError("Title column not found — check your CSV headers above.")
+
+# ── normalise ────────────────────────────────────────────────
+
+d = df.copy()
+d["_idx"]        = range(len(d))
+d["_title_norm"] = d[title_col].astype(str).apply(norm_title)
+d["_doi"]        = d[doi_col].astype(str).apply(norm_doi)      if doi_col  else ""
+d["_pmid"]       = d[pmid_col].astype(str).apply(norm_pmid)    if pmid_col else ""
+d["_pmc"]        = d[pmc_col].astype(str).apply(norm_pmid)     if pmc_col  else ""
+d["_abs_norm"]   = d[abs_col].astype(str).apply(norm_abstract) if abs_col  else ""
+d["_year"]       = d[year_col].astype(str).apply(norm_year)    if year_col else ""
+d["_auth_key"]   = d[auth_col].astype(str).apply(first_author_key) if auth_col else ""
+
+# ── reply / letter / erratum guard ───────────────────────────
+# Titles ending with these words are distinct article types and
+# must never be merged with the original article.
+REPLY_SUFFIXES = r"[\-\s]*(reply|comment|letter|erratum|correction|editorial|response|rejoinder)\s*$"
+d["_is_reply"] = d["_title_norm"].str.contains(REPLY_SUFFIXES, regex=True, na=False)
+print(f"  Reply/letter/erratum records flagged: {d['_is_reply'].sum()}")
+
+# ── completeness score (prefer the most complete record) ─────
+# Higher weights for fields most useful for downstream screening
+
+score_cols = [c for c in [title_col, doi_col, pmid_col, pmc_col, year_col,
+                           auth_col, abs_col, journal_col, pages_col, vol_col, iss_col] if c]
+
+def completeness(row):
+    s = sum(1 for c in score_cols
+            if pd.notna(row.get(c)) and str(row.get(c, "")).strip()
+            and str(row.get(c, "")).lower() not in ("nan", "none", ""))
+    # Bonus for high-value identifiers
+    s += 4 * bool(row.get("_doi"))
+    s += 3 * bool(row.get("_pmid"))
+    s += 1 * bool(row.get("_pmc"))
+    # Bonus for long abstract (more useful for screening)
+    abs_len = len(str(row.get("_abs_norm", "")))
+    if abs_len >= 200: s += 3
+    elif abs_len >= 50: s += 1
+    # Bonus for having journal + volume + pages (full bibliographic record)
+    has_journal = journal_col and pd.notna(row.get(journal_col)) and str(row.get(journal_col, "")).strip() not in ("", "nan")
+    has_vol     = vol_col and pd.notna(row.get(vol_col)) and str(row.get(vol_col, "")).strip() not in ("", "nan")
+    has_pages   = pages_col and pd.notna(row.get(pages_col)) and str(row.get(pages_col, "")).strip() not in ("", "nan")
+    s += 2 * (has_journal and has_vol and has_pages)
+    return s
+
+d["_score"] = d.apply(completeness, axis=1)
+
+# ── Union-Find ───────────────────────────────────────────────
+
+class UnionFind:
+    def __init__(self, n):
+        self.p = list(range(n)); self.r = [0] * n
+    def find(self, x):
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]; x = self.p[x]
+        return x
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb: return
+        if   self.r[ra] < self.r[rb]: self.p[ra] = rb
+        elif self.r[ra] > self.r[rb]: self.p[rb] = ra
+        else: self.p[rb] = ra; self.r[ra] += 1
+
+uf    = UnionFind(len(d))
+pairs = []   # list of (idx_a, idx_b, match_type, similarity)
+
+def link_exact(col, label):
+    groups = d[d[col] != ""].groupby(col)["_idx"].apply(list)
+    for _, idxs in groups.items():
+        if len(idxs) < 2: continue
+        for j in idxs[1:]:
+            uf.union(idxs[0], j)
+            pairs.append((idxs[0], j, label, 100))
+
+# ── exact ID matches ─────────────────────────────────────────
+
+if CHECK_DOI:  link_exact("_doi",  "DOI_EXACT")
+if CHECK_PMID: link_exact("_pmid", "PMID_EXACT")
+link_exact("_pmc", "PMCID_EXACT")
+
+# ── year + first-author + title exact ────────────────────────
+# Catches same paper from different databases when DOI/PMID missing.
+# Uses full title norm (not just first 40 chars) to avoid false merges
+# on numbered series (WP1 vs WP2, Part I vs Part II, etc.)
+d["_yat"] = d["_year"] + "|" + d["_auth_key"] + "|" + d["_title_norm"]
+_yat_valid = (d["_year"].ne("") & d["_auth_key"].ne("") &
+              d["_title_norm"].str.len().gt(20))
+link_exact_mask = d[_yat_valid].groupby("_yat")["_idx"].apply(list)
+for _, idxs in link_exact_mask.items():
+    if len(idxs) < 2: continue
+    for j in idxs[1:]:
+        uf.union(idxs[0], j)
+        pairs.append((idxs[0], j, "YEAR_AUTHOR_TITLE_EXACT", 100))
+
+# ── abstract fuzzy (all-pairs within prefix block) ───────────
+# Guards: year must be compatible, author must match if both present
+if CHECK_ABSTRACT and abs_col:
+    d["_abs_pref"] = d["_abs_norm"].str[:ABS_PREFIX_LEN]
+    blocks = d[d["_abs_norm"].str.len() >= ABS_MIN_LEN].groupby("_abs_pref", dropna=False)
+    for _, g in tqdm(blocks, desc="Abstract blocks"):
+        idxs  = g["_idx"].tolist()
+        abss  = g["_abs_norm"].tolist()
+        years = g["_year"].tolist()
+        auths = g["_auth_key"].tolist()
+        for i in range(len(idxs)):
+            for j in range(i + 1, len(idxs)):
+                if not years_compatible(years[i], years[j]):
+                    continue
+                if not authors_compatible(auths[i], auths[j]):
+                    continue
+                sim = fuzz.ratio(abss[i], abss[j])
+                if sim >= ABS_THR:
+                    uf.union(idxs[i], idxs[j])
+                    pairs.append((idxs[i], idxs[j], f"ABSTRACT_FUZZY_{ABS_THR}", sim))
+
+# ── title fuzzy (all-pairs within prefix block) ──────────────
+# Uses token_sort_ratio only — preserves extra words like "Reply".
+# Guards: reply type must match, year must be compatible,
+#         author must match if both present.
+if CHECK_TITLE:
+    d["_title_pref"] = d["_title_norm"].str[:20]
+    title_blocks = d[d["_title_norm"].str.len() > 10].groupby("_title_pref", dropna=False)
+    for _, g in tqdm(title_blocks, desc="Title blocks"):
+        idxs     = g["_idx"].tolist()
+        titles   = g["_title_norm"].tolist()
+        is_reply = g["_is_reply"].tolist()
+        years    = g["_year"].tolist()
+        auths    = g["_auth_key"].tolist()
+        for i in range(len(idxs)):
+            for j in range(i + 1, len(idxs)):
+                # Never merge a reply/letter with a non-reply record
+                if is_reply[i] != is_reply[j]:
+                    continue
+                if not years_compatible(years[i], years[j]):
+                    continue
+                if not authors_compatible(auths[i], auths[j]):
+                    continue
+                sim = fuzz.token_sort_ratio(titles[i], titles[j])
+                if sim >= TITLE_THR:
+                    uf.union(idxs[i], idxs[j])
+                    pairs.append((idxs[i], idxs[j], f"TITLE_FUZZY_{TITLE_THR}", sim))
+
+# ── select best record per cluster ───────────────────────────
+
+d["_cluster"] = d["_idx"].apply(uf.find)
+d_sorted = d.sort_values(["_cluster", "_score"], ascending=[True, False])
+keep_idx = set(d_sorted.groupby("_cluster")["_idx"].first().values)
+
+# ── label each duplicate with the strongest removal reason ───
+
+reason_rank = {
+    "DOI_EXACT": 7, "PMID_EXACT": 6, "PMCID_EXACT": 5,
+    "YEAR_AUTHOR_TITLE_EXACT": 4,
+    f"ABSTRACT_FUZZY_{ABS_THR}": 3,
+    f"TITLE_FUZZY_{TITLE_THR}": 2,
+    "CLUSTER_DUPLICATE": 1,
+}
+
+pairs_df = pd.DataFrame(pairs, columns=["idx_a", "idx_b", "match_type", "similarity"])
+best_reason = {}
+for _, row in pairs_df.iterrows():
+    removed = row.idx_b if row.idx_a in keep_idx else (row.idx_a if row.idx_b in keep_idx else None)
+    if removed is None: continue
+    cur = best_reason.get(removed)
+    if cur is None or reason_rank.get(row.match_type, 0) > reason_rank.get(cur["type"], 0):
+        best_reason[removed] = {"type": row.match_type, "sim": row.similarity}
+
+# ── build output dataframes ───────────────────────────────────
+
+internal = [c for c in d.columns if c.startswith("_")]
+keep_mask  = d["_idx"].isin(keep_idx)
+dedup      = d[keep_mask].drop(columns=internal)
+duplicates = d[~keep_mask].drop(columns=internal).copy()
+duplicates["dup_reason"]     = duplicates.index.map(
+    lambda i: best_reason.get(d.loc[i, "_idx"], {}).get("type", "CLUSTER_DUPLICATE"))
+duplicates["dup_similarity"] = duplicates.index.map(
+    lambda i: best_reason.get(d.loc[i, "_idx"], {}).get("sim", ""))
+
+# ── report ───────────────────────────────────────────────────
+
+print("\n" + "=" * 50)
+print(f"  Total input records  : {len(d):>7,}")
+print(f"  Unique (kept)        : {len(dedup):>7,}")
+print(f"  Duplicates removed   : {len(duplicates):>7,}  ({len(duplicates)/len(d)*100:.1f}%)")
+print("=" * 50)
+print("\nRemoval reasons:")
+print(duplicates["dup_reason"].value_counts().to_string())
+
+# ── save ─────────────────────────────────────────────────────
+
+dedup.to_csv(OUT_DEDUP,  index=False, encoding="utf-8-sig")
+duplicates.to_csv(OUT_DUPS, index=False, encoding="utf-8-sig")
+pairs_df.to_csv(OUT_PAIRS, index=False, encoding="utf-8-sig")
+
+print(f"\nSaved to Drive:")
+print(f"  {OUT_DEDUP}")
+print(f"  {OUT_DUPS}")
+print(f"  {OUT_PAIRS}")
+
+# ── CELL 6 · Spot-check: review sample pairs ────────────────
+import textwrap
+
+title_col_local = title_col
+
+print(f"Showing 20 sample duplicate pairs\n{'─' * 70}")
+sample = pairs_df.sample(min(20, len(pairs_df)), random_state=42)
+for _, row in sample.iterrows():
+    ia, ib = int(row.idx_a), int(row.idx_b)
+    ta = df.iloc[ia][title_col_local] if title_col_local else "(no title)"
+    tb = df.iloc[ib][title_col_local] if title_col_local else "(no title)"
+    print(f"[{row.match_type}  sim={row.similarity:.0f}]")
+    print(f"  A: {textwrap.shorten(str(ta), 90)}")
+    print(f"  B: {textwrap.shorten(str(tb), 90)}")
+    print()
+
+# ============================================================
+# PRISMA TITLE/ABSTRACT SCREENING — v4
+# Semaglutide + perioperative outcomes | Colab
+#
+# APPROACH: 3-gate rules (primary) + ML query similarity (secondary)
+#   Gate 1 — GLP-1 / semaglutide mention
+#   Gate 2 — Perioperative context
+#   Gate 3 — ≥1 of 5 IC3 outcome domains
+#
+#   ML model rescues borderline Gate-3 misses at very high threshold.
+#   Final decision is always binary: include / exclude.
+#
+# Outputs (Google Drive):
+#   1) AI_screening_ALL.csv
+#   2) AI_screening_INCLUDED.csv
+#   3) AI_screening_AUTO_EXCLUDED.csv
+#   4) PRISMA_FLOW.txt
+# ============================================================
+
+import os, re, sys, subprocess
+
+# -----------------------
+# 0) FIX ENV (Colab-safe pins)
+# -----------------------
+PINNED = {
+    "numpy": "1.26.4",
+    "pandas": "2.2.2",
+    "scipy": "1.13.1",
+    "scikit-learn": "1.5.2",
+}
+
+def get_ver(pkg):
+    try:
+        import importlib.metadata as md
+        return md.version(pkg)
+    except Exception:
+        return None
+
+need_fix = any(get_ver(p) != v for p, v in PINNED.items())
+if need_fix:
+    pkgs = [f"{p}=={v}" for p, v in PINNED.items()]
+    print("Fixing package versions...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                           "--upgrade", "--force-reinstall"] + pkgs)
+    print("Versions fixed. Restarting runtime...")
+    os.kill(os.getpid(), 9)
+
+# -----------------------
+# 1) Imports
+# -----------------------
+import numpy as np
+import pandas as pd
+from scipy.sparse import hstack, csr_matrix
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics.pairwise import cosine_similarity
+
+# -----------------------
+# 2) Mount Google Drive
+# -----------------------
+from google.colab import drive
+DRIVE_ROOT = "/content/drive"
+if not os.path.ismount(DRIVE_ROOT):
+    drive.mount(DRIVE_ROOT)
+else:
+    print("Drive already mounted")
+
+# -----------------------
+# 3) PATHS - EDITABLE
+# -----------------------
+OUT_DIR   = [PATH_REMOVED]
+os.makedirs(OUT_DIR, exist_ok=True)
+
+INPUT_CSV = os.path.join(OUT_DIR, "deduplicated.csv")
+OUT_ALL   = os.path.join(OUT_DIR, "AI_screening_ALL.csv")
+OUT_INCL  = os.path.join(OUT_DIR, "AI_screening_INCLUDED.csv")
+OUT_EXCL  = os.path.join(OUT_DIR, "AI_screening_AUTO_EXCLUDED.csv")
+OUT_PRIS  = os.path.join(OUT_DIR, "PRISMA_FLOW.txt")
+
+if not os.path.exists(INPUT_CSV):
+    raise FileNotFoundError(f"INPUT_CSV not found: {INPUT_CSV}")
+
+# ==============================================================
+# TUNING KNOBS
+#   MIN_OUTCOME_DOMAINS : raise to 2 if still too many results
+#   ML_RESCUE_THR       : probability threshold to rescue a record
+#                         that passed Gates 1+2 but failed Gate 3
+#                         Set 0.0 to disable ML rescue entirely
+# ==============================================================
+MIN_OUTCOME_DOMAINS = 1
+ML_RESCUE_THR       = 0.90
+
+# -----------------------
+# 4) HELPERS
+# -----------------------
+def norm_text(s):
+    s = "" if s is None or (isinstance(s, float) and np.isnan(s)) else str(s)
+    return re.sub(r"\s+", " ", s.lower().strip())
+
+def find_col(df, keys):
+    cols = {c.lower(): c for c in df.columns}
+    for k in keys:
+        if k.lower() in cols:
+            return cols[k.lower()]
+    for c in df.columns:
+        if any(k.lower() in c.lower() for k in keys):
+            return c
+    return None
+
+def any_match(text, patterns):
+    return any(re.search(p, text) for p in patterns)
+
+# -----------------------
+# 5) LOAD DATA
+# -----------------------
+df = pd.read_csv(INPUT_CSV)
+n_after_dedup = len(df)
+print(f"\nCSV loaded | {df.shape[0]} rows, {df.shape[1]} cols")
+
+title_col = find_col(df, ["title"])
+abs_col   = find_col(df, ["abstract", "summary", "abstract_note", "abstract note"])
+kw_col    = find_col(df, ["keywords", "keyword"])
+notes_col = find_col(df, ["notes", "note"])
+
+print(f"Columns → title: {title_col} | abstract: {abs_col} | "
+      f"keywords: {kw_col} | notes: {notes_col}")
+
+if title_col is None:
+    raise ValueError(f"No Title column found. Available: {list(df.columns)}")
+if abs_col is None:
+    df["_abstract_tmp"] = ""
+    abs_col = "_abstract_tmp"
+    print("WARNING: No abstract column — using empty strings.")
+
+def safe_col(c):
+    return df[c].astype(str) if c and (c in df.columns) else pd.Series([""] * len(df))
+
+n_missing_abstract = (
+    df[abs_col].isna().sum() +
+    (df[abs_col].astype(str).str.strip().isin(["", "nan"])).sum()
+)
+print(f"Records with missing/empty abstract: {n_missing_abstract}")
+
+df["_title_norm"]    = safe_col(title_col).apply(norm_text)
+df["_abstract_norm"] = safe_col(abs_col).apply(norm_text)
+df["_has_abstract"]  = (~df["_abstract_norm"].str.strip().isin(["", "nan"])).astype(int)
+
+df["_text"] = (
+    safe_col(title_col) + " " +
+    safe_col(abs_col)   + " " +
+    safe_col(kw_col)    + " " +
+    safe_col(notes_col)
+).apply(norm_text)
+
+# -----------------------
+# 6) TERM LISTS — protocol-mapped (EDITABLE - for other researchers)
+# -----------------------
+
+# ── GATE 1: GLP-1 / Semaglutide (IC2) ────────────────────────────────────
+# Includes semaglutide by name AND GLP-1 class terms.
+# Papers studying the GLP-1 class without naming semaglutide explicitly
+# are still relevant (semaglutide is a GLP-1 RA).
+# Specificity is enforced by Gates 2 and 3.
+SEMAGLUTIDE_TERMS = [
+    r"\bsemaglutide\b", r"\bozempic\b", r"\bwegovy\b", r"\brybelsus\b",
+    r"\bglp[- ]?1\b",
+    r"\bglp[- ]?1 receptor agonist\w*",
+    r"\bglucagon[- ]like peptide[- ]?1\b",
+    r"\bglucagon[- ]like peptide 1 receptor agonist\w*",
+    r"\bglp1[- ]?ra\b",
+    r"\bglp[- ]?1[- ]?ra\b",
+    r"\bincretin\w*",
+]
+
+# ── GATE 2: Perioperative context (IC3 header) ────────────────────────────
+PERIOP_TERMS = [
+    r"\bperioperat\w*", r"\bpreoperat\w*", r"\bintraoperat\w*", r"\bpostoperat\w*",
+    r"\bsurger\w*", r"\bsurgical\b", r"\boperative\b",
+    r"\banesth\w*", r"\banaesth\w*", r"\bsedat\w*",
+    r"\bendoscop\w*", r"\bcolonoscop\w*", r"\begd\b", r"\bgastroscop\w*",
+    r"\bintubat\w*", r"\bairway\b",
+    r"\bfasting\b", r"\bnpo\b", r"\bnil by mouth\b",
+    r"\blaparoscop\w*", r"\bbariatric\b",
+    r"\bprocedur\w*",
+]
+
+# ── GATE 3: Outcome domains IC3a–e ───────────────────────────────────────
+
+# IC3a – Residual gastric content
+# CORRECTED: "gastric emptying", "gastric volume", and "gastroparesis"
+# now require proximity to a perioperative term (within 80 chars).
+# Rationale: these terms appear heavily in diabetes pharmacology papers
+# (e.g. "gastric emptying rate", "fasting gastric volume") where they
+# describe metabolic endpoints, NOT perioperative safety.
+# "fasting" deliberately excluded from proximity trigger — it is
+# extremely common in diabetes abstracts as "fasting glucose/insulin".
+_PERIOP_PROX = r"(periop\w*|preoperat\w*|anesth\w*|surger\w*|intubat\w*|endoscop\w*|sedation|aspiration|npo|nil by mouth)"
+GASTRIC_TERMS = [
+    r"\bresidual gastric\b",        # always specific to periop safety
+    r"\bgastric content\b",         # always specific
+    r"\bstomach content\b",         # always specific
+    r"\bfull stomach\b",            # always specific
+    r"\bretained gastric\b",        # always specific
+    r"\bgastric ultrasound\b",      # always anesthesia context
+    r"\bgastric residual\b",        # always specific
+    # gastroparesis only when near periop terms
+    r"\bgastropar\w*.{0,80}" + _PERIOP_PROX,
+    _PERIOP_PROX + r".{0,80}\bgastropar\w*",
+    # gastric emptying only when near periop terms (not "fasting glucose")
+    r"\bgastric emptying\b.{0,80}" + _PERIOP_PROX,
+    _PERIOP_PROX + r".{0,80}\bgastric emptying\b",
+    # gastric volume only when near periop/ultrasound terms
+    r"\bgastric volume\b.{0,80}" + _PERIOP_PROX,
+    _PERIOP_PROX + r".{0,80}\bgastric volume\b",
+    r"\bgastric volume\b.{0,80}\bultrasound\b",
+    r"\bultrasound\b.{0,80}\bgastric volume\b",
+]
+
+# IC3b – Aspiration / regurgitation
+# "aspiration" alone excluded — too generic (needle aspiration, joint aspiration)
+ASPIRATION_TERMS = [
+    r"\bpulmonary aspiration\b",
+    r"\bbronchial aspiration\b",
+    r"\baspiration pneumonitis\b",
+    r"\baspiration pneumonia\b",
+    r"\bregurgitat\w*",
+    r"\bsilent aspiration\b",
+]
+
+# IC3c – Airway management complications
+AIRWAY_TERMS = [
+    r"\bdifficult intubat\w*",
+    r"\bdifficult airway\b",
+    r"\bfailed intubat\w*",
+    r"\bemergent intubat\w*",
+    r"\brapid sequence intubat\w*",
+    r"\brsi\b",
+    r"\bairway complication\w*",
+    r"\bairway management\b",
+    r"\blaryngospasm\b",
+    r"\bbronchospasm\b",
+]
+
+# IC3d – Semaglutide/GLP-1 withdrawal / hold period
+WITHDRAWAL_TERMS = [
+    r"\bpreoperative (hold|discontinu|withhold|cessation|suspension)\w*",
+    r"\bsemaglutide\b.{0,80}(withdr\w*|held|hold\w*|stop\w*|discontinu\w*|pause\w*|cessation|washout|suspend\w*)",
+    r"(withdr\w*|held|hold\w*|stop\w*|discontinu\w*|pause\w*|cessation|washout|suspend\w*).{0,80}\bsemaglutide\b",
+    r"\bglp[- ]?1\b.{0,80}(withdr\w*|discontinu\w*|hold|washout)",
+]
+
+# IC3e – Overall perioperative complications
+# CORRECTED: added "respiratory complication\w*" and "postoperative respiratory\b"
+# These patterns are needed to catch titles like:
+# "...Risk of Postoperative Respiratory Complications" (JAMA 2024, Dixit et al.)
+COMPLICATION_TERMS = [
+    r"\bperioperative complication\w*",
+    r"\bpostoperative complication\w*",
+    r"\bsurgical complication\w*",
+    r"\banesthetic complication\w*",
+    r"\bperioperative (outcome|risk|safety|adverse)\w*",
+    r"\bpostoperative (outcome|morbidity|mortality|adverse)\w*",
+    r"\badverse perioperative\b",
+    r"\bintraoperative (event|complication)\w*",
+    r"\brespiratory complication\w*",    # NEW: catches "postoperative respiratory complications"
+    r"\bpostoperative respiratory\b",    # NEW: catches "risk of postoperative respiratory..."
+]
+
+ALL_OUTCOME_DOMAINS = [
+    GASTRIC_TERMS,
+    ASPIRATION_TERMS,
+    AIRWAY_TERMS,
+    WITHDRAWAL_TERMS,
+    COMPLICATION_TERMS,
+]
+OUTCOME_DOMAIN_NAMES = [
+    "IC3a_gastric", "IC3b_aspiration", "IC3c_airway",
+    "IC3d_withdrawal", "IC3e_complication",
+]
+
+# ── HARD EXCLUSION RULES ─────────────────────────────────────────────────
+
+# EC4: Non-original study types
+NON_ORIGINAL_TERMS = [
+    r"\bsystematic review\b", r"\bmeta[- ]?analysis\b", r"\bmetaanalysis\b",
+    r"\bscoping review\b",    r"\bnarrative review\b",  r"\bliterature review\b",
+    r"\bguideline\b",         r"\bpractice guideline\b",
+    r"\bconsensus statement\b", r"\bconsensus\b",
+    r"\bcase report\b",       r"\bcase series\b",
+    r"\beditorial\b",         r"\bletter to the editor\b",
+    r"\bcommentary\b",        r"\bexpert opinion\b",    r"\bposition statement\b",
+]
+
+# EC3: Other specific GLP-1 agents — excluded ONLY if no semaglutide AND
+# no GLP-1 class term present (pure competitor-drug paper)
+OTHER_GLP1_TERMS = [
+    r"\bliraglutide\b", r"\bsaxenda\b",   r"\bvictoza\b",
+    r"\bdulaglutide\b", r"\btrulicity\b",
+    r"\bexenatide\b",   r"\bbyetta\b",    r"\bbydureon\b",
+    r"\blixisenatide\b", r"\badlyxin\b",
+    r"\btirzepatide\b", r"\bmounjaro\b",  r"\bzepbound\b",
+]
+
+# EC1 proxy: Pediatric / non-adult populations
+PEDIATRIC_TERMS = [
+    r"\bpediatric\b", r"\bpaediatric\b", r"\bchildren\b",
+    r"\badolescent\w*", r"\bneonate\w*", r"\binfant\w*", r"\bnewborn\b",
+]
+
+# Animal studies
+ANIMAL_TERMS = [
+    r"\bmouse\b", r"\bmice\b", r"\brat\b", r"\brats\b",
+    r"\bporcine\b", r"\bcanine\b", r"\bovine\b", r"\bmurine\b",
+    r"\banimal model\w*", r"\brodent\w*", r"\bin[- ]vivo\b",
+]
+
+# EC5: Non-English markers (conservative)
+NON_ENGLISH_TERMS = [
+    r"\bresumen\b", r"\bresumo\b", r"\bzusammenfassung\b", r"\brésumé\b",
+    r"\babstract.{0,20}(en español|em português|auf deutsch|en français)\b",
+]
+
+# -----------------------
+# 7) CLASSIFY EACH RECORD
+# -----------------------
+def classify(row):
+    text  = row["_text"]
+    title = row["_title_norm"]
+
+    # ── Gates ──
+    gate1 = any_match(text, SEMAGLUTIDE_TERMS)
+    gate2 = any_match(text, PERIOP_TERMS)
+    domain_hits = [any_match(text, d) for d in ALL_OUTCOME_DOMAINS]
+    n_domains   = sum(domain_hits)
+    gate3       = n_domains >= MIN_OUTCOME_DOMAINS
+
+    # ── Hard exclusion ──
+    ex_non_orig    = any_match(text, NON_ORIGINAL_TERMS)
+    ex_pediatric   = any_match(text, PEDIATRIC_TERMS)
+    ex_animal      = any_match(text, ANIMAL_TERMS)
+    ex_non_english = any_match(text, NON_ENGLISH_TERMS)
+
+    has_other_glp1    = any_match(text, OTHER_GLP1_TERMS)
+    has_sema_explicit = any_match(text, [r"\bsemaglutide\b", r"\bozempic\b",
+                                         r"\bwegovy\b",      r"\brybelsus\b"])
+    has_glp1_class    = any_match(text, [r"\bglp[- ]?1\b",
+                                         r"\bglucagon[- ]like peptide[- ]?1\b",
+                                         r"\bglp1[- ]?ra\b", r"\bglp[- ]?1[- ]?ra\b"])
+    # EC3: only exclude if competitor drug paper with NO semaglutide and NO GLP-1 class
+    ex_other_glp1_only = has_other_glp1 and (not has_sema_explicit) and (not has_glp1_class)
+
+    hard_exclude = ex_non_orig or ex_animal or ex_pediatric or ex_other_glp1_only
+
+    # Exclusion reasons — mapped to protocol criteria for audit trail
+    reasons = []
+    if ex_non_orig:        reasons.append("EC4:non_original")
+    if ex_animal:          reasons.append("animal_study")
+    if ex_pediatric:       reasons.append("EC1_proxy:pediatric")
+    if ex_other_glp1_only: reasons.append("EC3:other_GLP1_only")
+    if ex_non_english:     reasons.append("EC5:non_english_marker")
+    if not gate1:          reasons.append("no_GLP1_semaglutide_term")
+    if not gate2:          reasons.append("no_periop_context")
+    if not gate3:          reasons.append("no_outcome_domain")
+
+    # Primary decision — strict binary, no uncertain category
+    if gate1 and gate2 and gate3 and not hard_exclude:
+        decision = "include"
+    else:
+        decision = "exclude"
+
+    return {
+        "gate1_glp1":            int(gate1),
+        "gate2_periop":          int(gate2),
+        "gate3_outcome":         int(gate3),
+        "n_outcome_domains":     n_domains,
+        **{OUTCOME_DOMAIN_NAMES[i]: int(domain_hits[i]) for i in range(5)},
+        "sema_in_title":         int(any_match(title, SEMAGLUTIDE_TERMS)),
+        "ex_non_original":       int(ex_non_orig),
+        "ex_pediatric":          int(ex_pediatric),
+        "ex_animal":             int(ex_animal),
+        "ex_other_glp1_only":    int(ex_other_glp1_only),
+        "ex_non_english":        int(ex_non_english),
+        "flag_missing_abstract": int(not row["_has_abstract"]),
+        "exclusion_reasons":     ";".join(reasons),
+        "rule_decision":         decision,
+    }
+
+print("\nApplying 3-gate rules...")
+results = df.apply(classify, axis=1).apply(pd.Series)
+df = pd.concat([df, results], axis=1)
+
+print("Rule-based decisions:")
+print(df["rule_decision"].value_counts())
+
+# -----------------------
+# 8) ML MODEL (secondary — rescues borderline Gate-3 misses only)
+#
+# Uses word TF-IDF + character TF-IDF (catches morphological variants)
+# + cosine similarity to the structured query.
+# Trained on rule-includes (positive) vs clear non-GLP1/non-periop (negative).
+# Only applied to records that passed Gates 1+2 but failed Gate 3,
+# and only at a very high confidence threshold (ML_RESCUE_THR).
+# -----------------------
+QUERY_TEXT = """
+(glucagon-like peptide-1 OR GLP-1 OR GLP1 OR GLP1-RA OR semaglutide OR ozempic OR wegovy OR rybelsus)
+(endoscopy OR upper endoscopy OR EGD OR gastroscopy OR colonoscopy OR sedation OR anesthesia OR surgery OR perioperative)
+(residual gastric content OR retained gastric OR gastric emptying OR gastric volume OR aspiration OR regurgitation OR pneumonia OR respiratory complications)
+(withholding OR discontinuation OR hold OR suspension OR cessation OR washout)
+""".strip()
+
+query = norm_text(QUERY_TEXT)
+
+# Word TF-IDF
+vec_word = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_df=0.90,
+                            sublinear_tf=True, stop_words="english")
+Xw = vec_word.fit_transform(df["_text"].values)
+qw = vec_word.transform([query])
+sim_word = cosine_similarity(Xw, qw).ravel()
+
+# Character TF-IDF (catches morphological variants, abbreviations)
+vec_char = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5),
+                            min_df=2, max_df=0.95)
+Xc = vec_char.fit_transform(df["_text"].values)
+qc = vec_char.transform([query])
+sim_char = cosine_similarity(Xc, qc).ravel()
+
+df["sim_query"] = np.maximum(sim_word, sim_char)
+
+# Weak labels: rule-includes = positive, clear non-GLP1 or non-periop = negative
+train_pos = df[df["rule_decision"] == "include"]
+train_neg = df[(df["gate1_glp1"] == 0) | (df["gate2_periop"] == 0)]
+train_neg = train_neg.sample(
+    n=min(len(train_neg), len(train_pos) * 3),
+    random_state=42
+)
+train_df = pd.concat([train_pos.assign(_wl=1), train_neg.assign(_wl=0)])
+
+USE_MODEL = len(train_df) >= 50
+if USE_MODEL:
+    Xw_tr = vec_word.transform(train_df["_text"].values)
+    Xc_tr = vec_char.transform(train_df["_text"].values)
+    X_tr  = hstack([Xw_tr, Xc_tr,
+                    csr_matrix(train_df["sim_query"].values.reshape(-1, 1))],
+                   format="csr")
+    clf = LogisticRegression(max_iter=4000, class_weight="balanced",
+                              C=0.5, random_state=42, n_jobs=-1)
+    clf.fit(X_tr, train_df["_wl"].astype(int).values)
+
+    X_all = hstack([Xw, Xc,
+                    csr_matrix(df["sim_query"].values.reshape(-1, 1))],
+                   format="csr")
+    df["p_include_model"] = clf.predict_proba(X_all)[:, 1]
+    print(f"\nModel trained | pos={len(train_pos)} neg={len(train_neg)}")
+    print(df["p_include_model"].describe(percentiles=[0.50, 0.75, 0.90, 0.95, 0.99]))
+else:
+    df["p_include_model"] = np.nan
+    print("Skipping ML — insufficient training data.")
+
+# -----------------------
+# 9) FINAL DECISION
+#    Rules are primary. ML only rescues records that:
+#      - Passed Gate 1 (GLP-1 term) ✓
+#      - Passed Gate 2 (periop context) ✓
+#      - Failed Gate 3 (no outcome domain matched) ✗
+#      - Pass no hard-exclusion rule
+#      - Have model probability ≥ ML_RESCUE_THR
+# -----------------------
+df["ai_decision"] = df["rule_decision"]
+
+if USE_MODEL and ML_RESCUE_THR > 0:
+    rescue_mask = (
+        (df["rule_decision"]      == "exclude") &
+        (df["gate1_glp1"]         == 1) &
+        (df["gate2_periop"]       == 1) &
+        (df["ex_non_original"]    == 0) &
+        (df["ex_animal"]          == 0) &
+        (df["ex_pediatric"]       == 0) &
+        (df["ex_other_glp1_only"] == 0) &
+        (df["p_include_model"]    >= ML_RESCUE_THR)
+    )
+    df.loc[rescue_mask, "ai_decision"] = "include"
+    df.loc[rescue_mask, "exclusion_reasons"] = (
+        df.loc[rescue_mask, "exclusion_reasons"] + ";rescued_by_ML"
+    )
+    print(f"\nML rescued {int(rescue_mask.sum())} records (threshold p≥{ML_RESCUE_THR})")
+
+print("\nFinal decisions:")
+print(df["ai_decision"].value_counts())
+
+# -----------------------
+# 10) PRISMA FLOW
+# -----------------------
+n_include = int((df["ai_decision"] == "include").sum())
+n_exclude = int((df["ai_decision"] == "exclude").sum())
+excl_tmp  = df[df["ai_decision"] == "exclude"]
+
+def ce(col):
+    return int((excl_tmp[col] == 1).sum()) if col in excl_tmp.columns else 0
+
+n_no_sema    = int((excl_tmp["gate1_glp1"] == 0).sum())
+n_no_periop  = int(((excl_tmp["gate1_glp1"] == 1) &
+                    (excl_tmp["gate2_periop"] == 0)).sum())
+n_no_outcome = int(((excl_tmp["gate1_glp1"] == 1) &
+                    (excl_tmp["gate2_periop"] == 1) &
+                    (excl_tmp["gate3_outcome"] == 0)).sum())
+
+prisma_text = f"""
+==============================================================
+PRISMA FLOW — Title/Abstract Screening (AI-assisted v4)
+==============================================================
+
+Records after deduplication:                {n_after_dedup}
+  of which missing/empty abstract:          {n_missing_abstract}
+
+── Screening logic ───────────────────────────────────────────
+  Primary:   3-gate rule (ALL gates required)
+  Secondary: ML rescue at p≥{ML_RESCUE_THR} (Gate 1+2 pass, Gate 3 miss only)
+
+  Gate 1 — GLP-1 / semaglutide mention (IC2)
+  Gate 2 — Perioperative context (IC3 header)
+  Gate 3 — ≥{MIN_OUTCOME_DOMAINS} of 5 IC3 outcome domain(s):
+           IC3a: residual gastric content
+           IC3b: aspiration / regurgitation
+           IC3c: airway management complications
+           IC3d: GLP-1/semaglutide withdrawal period
+           IC3e: perioperative / respiratory complications
+
+  Any gate failure OR hard exclusion rule → EXCLUDED
+  No uncertain category — binary include/exclude only.
+
+Title/Abstract Screening:
+  ├── INCLUDED : {n_include}
+  └── EXCLUDED : {n_exclude}
+
+Records forwarded to full-text review: {n_include}
+
+──────────────────────────────────────────────────────────────
+Exclusion breakdown:
+
+  No GLP-1/semaglutide term  [Gate 1 fail]: {n_no_sema}
+  No perioperative context   [Gate 2 fail]: {n_no_periop}
+  No outcome domain          [Gate 3 fail]: {n_no_outcome}
+
+  EC4 – Non-original study type:            {ce("ex_non_original")}
+       (reviews, meta-analyses, guidelines,
+        editorials, case reports/series)
+  EC3 – Other GLP-1 only (no semaglutide):  {ce("ex_other_glp1_only")}
+  EC1 proxy – Pediatric population:         {ce("ex_pediatric")}
+  Animal studies:                           {ce("ex_animal")}
+  EC5 – Non-English markers:                {ce("ex_non_english")}
+
+Note: one record can match multiple reasons.
+
+==============================================================
+FOR YOUR PRISMA FLOWCHART:
+  "Records screened"                  = {n_after_dedup}
+  "Records excluded (title/abstract)" = {n_exclude}
+  "Full-text articles assessed"       = {n_include}
+==============================================================
+"""
+print(prisma_text)
+with open(OUT_PRIS, "w", encoding="utf-8") as f:
+    f.write(prisma_text)
+print(f"PRISMA flow saved: {OUT_PRIS}")
+
+# -----------------------
+# 11) EXPORT CSVs
+# -----------------------
+drop_cols = ["_text", "_title_norm", "_abstract_norm", "_abstract_tmp",
+             "_has_abstract", "rule_decision", "_wl"]
+out_df  = df.drop(columns=drop_cols, errors="ignore").copy()
+incl_df = out_df[out_df["ai_decision"] == "include"].copy()
+excl_df = out_df[out_df["ai_decision"] == "exclude"].copy()
+
+out_df.to_csv(OUT_ALL,  index=False, encoding="utf-8-sig")
+incl_df.to_csv(OUT_INCL, index=False, encoding="utf-8-sig")
+excl_df.to_csv(OUT_EXCL, index=False, encoding="utf-8-sig")
+
+print(f"\nFiles saved:")
+print(f"  ALL      : {len(out_df):>5} rows → {OUT_ALL}")
+print(f"  INCLUDED : {len(incl_df):>5} rows → {OUT_INCL}")
+print(f"  EXCLUDED : {len(excl_df):>5} rows → {OUT_EXCL}")
+
+# -----------------------
+# 12) SANITY PREVIEW
+# -----------------------
+tcol = title_col if title_col in incl_df.columns else "title"
+
+print(f"\n── INCLUDED sample (first 15) ──")
+for i, (_, row) in enumerate(incl_df.head(15).iterrows()):
+    domains  = [OUTCOME_DOMAIN_NAMES[j] for j in range(5) if row.get(OUTCOME_DOMAIN_NAMES[j], 0) == 1]
+    rescued  = "ML" if "rescued_by_ML" in str(row.get("exclusion_reasons","")) else ""
+    p        = row.get("p_include_model", float("nan"))
+    print(f"  [{i+1}] {str(row.get(tcol,''))[:80]}{rescued}")
+    print(f"       domains: {', '.join(domains) or 'none'} | p={p:.2f}")
+
+print(f"\n── EXCLUDED sample (first 10) ──")
+for i, (_, row) in enumerate(excl_df.head(10).iterrows()):
+    print(f"  [{i+1}] {str(row.get(tcol,''))[:80]}")
+    print(f"       reasons: {row.get('exclusion_reasons','')}")
+
+print(f"\nDone. {n_include} included | {n_exclude} excluded")
+print(f"Forwarded to full-text review: {n_include} records")
+
+# Full-text review - Claude AI screener v7
+# Features:
+#   - temperature=0, max_tokens=1200 (reproducible, no truncation)
+#   - IC2: semaglutide must be in methods/results (not just intro)
+#   - EC4: clear accept/reject, label-agnostic
+#   - EC6: relaxed - any document with numbers (%, OR, p, CI) passes
+#   - PDF: get_text("blocks") extracts tables+prose on ALL PyMuPDF versions
+#   - Titles from filename, no manual overrides
+# Semaglutide + perioperative outcomes
+#
+# SETUP:
+#   1) Save Anthropic API key in: BASE_DIR/anthropic_key.txt
+#   2) Upload PDFs to: BASE_DIR/full_text_review/pdfs/
+#   3) Run - saves after every PDF, safe to stop/resume
+
+import os, re, sys, subprocess, time, json
+
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                       "PyMuPDF", "anthropic", "matplotlib"])
+
+# EDITABLE #
+
+from google.colab import drive
+if not os.path.ismount("/content/drive"):
+    drive.mount("/content/drive")
+else:
+    print("Drive already mounted")
+
+BASE_DIR      = [PATH_REMOVED]
+PDF_DIR       = os.path.join(BASE_DIR, "full_text_review", "pdfs")
+OUT_DIR       = os.path.join(BASE_DIR, "full_text_review")
+DECISIONS_CSV = os.path.join(OUT_DIR,  "full_text_decisions_claude.csv")
+OUT_INCL      = os.path.join(OUT_DIR,  "full_text_INCLUDED.csv")
+OUT_EXCL      = os.path.join(OUT_DIR,  "full_text_EXCLUDED.csv")
+OUT_SUMMARY   = os.path.join(OUT_DIR,  "full_text_summary.txt")
+os.makedirs(PDF_DIR, exist_ok=True)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ----------------------------------------------------------------
+# API KEY - EDITABLE
+# ----------------------------------------------------------------
+KEY_FILE = os.path.join(BASE_DIR, "anthropic_key.txt")
+if os.path.exists(KEY_FILE):
+    with open(KEY_FILE) as f:
+        api_key = f.read().strip()
+    print("API key loaded from file")
+elif os.environ.get("ANTHROPIC_API_KEY"):
+    api_key = os.environ["ANTHROPIC_API_KEY"]
+else:
+    api_key = input("Paste your Anthropic API key: ").strip()
+    with open(KEY_FILE, "w") as f:
+        f.write(api_key)
+    print("Key saved to " + KEY_FILE)
+
+import fitz
+import anthropic
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from collections import Counter
+
+client = anthropic.Anthropic(api_key=api_key)
+
+# ----------------------------------------------------------------
+# RESUME CONTROL
+# FORCE_FRESH = True  -> delete old CSV and rescreen all PDFs
+# FORCE_FRESH = False -> resume from last stopped point
+# ----------------------------------------------------------------
+FORCE_FRESH = True
+
+if FORCE_FRESH and os.path.exists(DECISIONS_CSV):
+    os.remove(DECISIONS_CSV)
+    print("Old decisions file deleted - starting fresh")
+
+# ----------------------------------------------------------------
+# PROTOCOL PROMPT - sent to Claude for every article -
+# EDITABLE for other researchers
+# ----------------------------------------------------------------
+SYSTEM_PROMPT = """You are a systematic review screener for a study on
+SEMAGLUTIDE and PERIOPERATIVE OUTCOMES.
+
+INCLUSION CRITERIA - ALL must be met:
+
+IC1  Adults aged 18 years and older.
+     Assume TRUE unless paper explicitly studies children or animals.
+
+IC2  SEMAGLUTIDE must be EXPLICITLY NAMED as a studied drug.
+     Accepted names: semaglutide, Ozempic, Wegovy, Rybelsus.
+
+     INCLUDE if ANY of these are true:
+       - Semaglutide is named in the METHODS or RESULTS as a
+         studied drug (sole, primary, or one of several)
+       - A drug breakdown table in methods/results lists semaglutide
+         with patient counts or percentages
+       - The exposure/cohort definition explicitly includes sema-
+         glutide patients (e.g. "patients on semaglutide were...")
+
+     EXCLUDE as EC3 if:
+       - Semaglutide appears ONLY in the introduction or background
+         as a general example, but is NOT part of the study cohort
+       - Semaglutide does not appear anywhere in the full text
+       - Only unnamed GLP-1 receptor agonists are studied
+
+     CRITICAL: Semaglutide mentioned ONLY in the introduction or
+     background section does NOT meet IC2. It must be part of the
+     actual study population described in methods or results.
+
+IC3  RCT or observational study (cohort, case-control, cross-sectional)
+     with ORIGINAL PATIENT DATA reporting at least ONE of:
+       IC3a  Residual gastric content
+       IC3b  Bronchial or pulmonary aspiration incidence
+       IC3c  Airway management complications (perioperative)
+       IC3d  Semaglutide withdrawal or hold period before procedure
+       IC3e  Overall perioperative complications
+
+     EXCLUDE as EC4 if the document is any of these:
+       - Narrative review, systematic review, or meta-analysis
+       - Editorial, commentary, or opinion piece
+       - Guideline or consensus statement
+       - Case report or case series (1-5 patients)
+       - Clinical trial registration without results
+       - Letter or correspondence that ONLY comments on another
+         paper without presenting its own patient data
+
+     ACCEPT (NOT EC4) if the document has ALL of these:
+       - Its own patient cohort (own n=)
+       - Its own study methods described
+       - Its own quantitative results reported
+     This applies regardless of label: a "research letter" or
+     "conference abstract" with own data IS original research.
+
+EXCLUSION CRITERIA:
+
+EC1  Comorbidity management is the PRIMARY focus, not semaglutide.
+EC2  Contraindications to semaglutide as primary focus.
+EC3  Semaglutide NOT explicitly named as a studied drug anywhere.
+EC4  No original patient data (see IC3 rules above).
+EC5  Non-English language.
+EC6  Significant missing data impeding analysis.
+     ALSO apply EC6 to any document (abstract or full paper) that
+     reports ONLY qualitative statements with NO numbers at all.
+     A document PASSES EC6 (do NOT exclude) if it contains ANY of:
+       - Percentages (e.g. "9.4% had retained content", "17.6%")
+       - Counts per group (e.g. "8/33 patients", "n=232")
+       - Odds or risk ratios (OR=, aOR=, RR=, HR=)
+       - P-values (p=0.001, p<0.05)
+       - Confidence intervals (95% CI)
+     A document FAILS EC6 only if it contains NO quantitative
+     outcome data whatsoever - e.g. only says "GLP-1 users had
+     more retained gastric content" with no supporting numbers.
+     NOTE: Section headers (Methods/Results) are NOT required.
+     A conference abstract with numbers PASSES EC6.
+
+Respond ONLY with a valid JSON object. No text before or after. No markdown.
+
+{
+  "decision": "include or exclude",
+  "criterion": "IC or EC1 or EC2 or EC3 or EC4 or EC5 or EC6 or IC1 or IC2 or IC3",
+  "ic1_met": true or false,
+  "ic2_semaglutide": true or false,
+  "ic2_note": "exact quote from paper where semaglutide is named as studied drug, or state it is absent",
+  "ic3_design_ok": true or false,
+  "ic3a": true or false,
+  "ic3b": true or false,
+  "ic3c": true or false,
+  "ic3d": true or false,
+  "ic3e": true or false,
+  "exclusion_criterion": "EC1/EC2/EC3/EC4/EC5/EC6 or null",
+  "exclusion_reason": "one sentence why excluded, or null",
+  "key_evidence": "exact text from paper showing semaglutide is or is not studied",
+  "reasoning": "2-3 sentences explaining your decision"
+}"""
+
+# ----------------------------------------------------------------
+# PDF EXTRACTION
+# ----------------------------------------------------------------
+# Uses get_text("blocks") which works on ALL PyMuPDF versions and
+# extracts every text region: prose, table cells, text boxes,
+# captions, footnotes. This ensures drug names that appear only
+# in tables (not in prose) are always captured.
+# ----------------------------------------------------------------
+def extract_pdf(path, max_chars=35000):
+    try:
+        doc = fitz.open(path)
+        all_text = ""
+
+        for page in doc:
+            # get_text("blocks") returns all text blocks including
+            # table cells as separate rectangular regions.
+            # Each block: (x0, y0, x1, y1, text, block_no, block_type)
+            # Sort by vertical then horizontal position for reading order.
+            blocks = page.get_text("blocks")
+            blocks = sorted(blocks, key=lambda b: (round(b[1]/10)*10, b[0]))
+            page_text = "\n".join(
+                b[4].strip() for b in blocks
+                if len(b) > 4 and b[4].strip()
+            )
+            all_text += page_text + "\n"
+            if len(all_text) >= max_chars:
+                break
+
+        doc.close()
+        cleaned = all_text[:max_chars].strip()
+        return cleaned if len(cleaned) > 150 else None
+
+    except Exception:
+        return None
+
+def get_title(pdf_text, fallback):
+    skip = [
+        r"^https?://", r"^\d+$", r"^doi\s*:",
+        r"^(citation|submitted|received|accepted|published)",
+        r"^(abstract|introduction|background|methods?|results?|discussion)",
+        r"^(copyright|all rights|open access|this is an open)",
+        r"^(figure|table|fig\.|supplementary)",
+        r"r\s+e\s+s\s+e\s+a\s+r\s+c\s+h",
+        r"^(review article|original article|case report|editorial|letter|commentary)",
+        r"^\d+\s*(division|department|university|hospital)",
+        r"^(as a library|nlm provides|pubmed)",
+        r"^(special issue|citation:|willson|al sakka)",
+        r"^schedules", r"^measuring continuous", r"^submit a",
+    ]
+    for line in pdf_text.split("\n"):
+        line = line.strip()
+        if not (35 <= len(line) <= 220):
+            continue
+        if any(re.search(p, line, re.IGNORECASE) for p in skip):
+            continue
+        if sum(c.isalpha() for c in line) / max(len(line), 1) < 0.55:
+            continue
+        return line[:130]
+    return fallback[:130]
+
+def title_from_filename(fname):
+    name = os.path.splitext(fname)[0]
+    name = re.sub(r"^\d+_", "", name)
+    name = name.replace("_", " ").replace("-", " ")
+    if name == name.upper():
+        name = name.title()
+    return name[:120]
+
+# ----------------------------------------------------------------
+# CLAUDE API CALL
+# ----------------------------------------------------------------
+def screen_with_claude(pdf_text, filename, retries=3):
+    user_msg = (
+        "Filename: " + filename + "\n\n"
+        "Article full text (first ~35000 chars):\n"
+        + "-" * 60 + "\n"
+        + pdf_text + "\n"
+        + "-" * 60 + "\n\n"
+        "Apply the protocol and respond with JSON only."
+    )
+    for attempt in range(retries):
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1200,
+                temperature=0,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_msg}]
+            )
+            raw = response.content[0].text.strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            result = json.loads(raw)
+            if "decision" not in result:
+                raise ValueError("Missing decision field")
+            return result
+        except json.JSONDecodeError:
+            if attempt < retries - 1:
+                time.sleep(3)
+            else:
+                return error_result("JSON parse error")
+        except anthropic.RateLimitError:
+            wait = 30 * (attempt + 1)
+            print("    Rate limit - waiting " + str(wait) + "s...")
+            time.sleep(wait)
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(5)
+            else:
+                return error_result("API error: " + str(e))
+    return error_result("Max retries exceeded")
+
+def error_result(msg):
+    return {
+        "decision": "error", "criterion": "ERR",
+        "ic1_met": None, "ic2_semaglutide": None, "ic2_note": "",
+        "ic3_design_ok": None,
+        "ic3a": False, "ic3b": False, "ic3c": False,
+        "ic3d": False, "ic3e": False,
+        "exclusion_criterion": None,
+        "exclusion_reason": msg,
+        "key_evidence": "",
+        "reasoning": msg,
+    }
+
+# ----------------------------------------------------------------
+# LOAD PREVIOUS PROGRESS
+# ----------------------------------------------------------------
+if os.path.exists(DECISIONS_CSV):
+    done_df      = pd.read_csv(DECISIONS_CSV)
+    done_df["decision"] = done_df["decision"].fillna("").astype(str)
+    already_done = set(done_df["filename"].astype(str).tolist())
+    print("Resuming - " + str(len(already_done)) + " articles already screened")
+else:
+    done_df      = pd.DataFrame()
+    already_done = set()
+
+# ----------------------------------------------------------------
+# SCREENING LOOP
+# ----------------------------------------------------------------
+all_pdfs = sorted([f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")])
+pending  = [f for f in all_pdfs if f not in already_done]
+
+if not all_pdfs:
+    raise FileNotFoundError("No PDFs found in " + PDF_DIR)
+
+print("\nPDFs found : " + str(len(all_pdfs)))
+print("Done       : " + str(len(already_done)))
+print("To screen  : " + str(len(pending)) + "\n")
+
+new_rows = []
+
+for i, fname in enumerate(pending, 1):
+    n_done = len(already_done) + i
+    print("[" + str(n_done) + "/" + str(len(all_pdfs)) + "] " + fname[:65])
+
+    title    = title_from_filename(fname)
+    pdf_text = extract_pdf(os.path.join(PDF_DIR, fname))
+
+    if pdf_text is None:
+        print("  WARNING: could not extract text - possibly scanned PDF")
+        result = error_result("PDF text extraction failed - scanned image")
+    else:
+        print("  " + str(len(pdf_text)) + " chars - sending to Claude...", end=" ", flush=True)
+        result = screen_with_claude(pdf_text, fname)
+        dec    = result.get("decision", "error")
+        crit   = result.get("criterion", "?")
+        icon   = "[INCLUDE]" if dec == "include" else "[EXCLUDE]"
+        print(icon + " " + crit)
+
+        if dec == "include":
+            domains = [d.upper() for d in ["ic3a","ic3b","ic3c","ic3d","ic3e"]
+                       if result.get(d) is True]
+            print("  Domains : " + (", ".join(domains) if domains else "none flagged"))
+            print("  Sema    : " + str(result.get("ic2_note",""))[:70])
+        else:
+            print("  Reason  : " + str(result.get("exclusion_reason",""))[:80])
+
+    new_rows.append({
+        "filename":           fname,
+        "title":              title,
+        "decision":           result.get("decision", "error"),
+        "criterion":          result.get("criterion", "ERR"),
+        "exclusion_reason":   result.get("exclusion_reason", ""),
+        "reasoning":          result.get("reasoning", ""),
+        "key_evidence":       result.get("key_evidence", ""),
+        "ic1_met":            result.get("ic1_met", ""),
+        "ic2_semaglutide":    result.get("ic2_semaglutide", ""),
+        "ic2_note":           result.get("ic2_note", ""),
+        "ic3_design_ok":      result.get("ic3_design_ok", ""),
+        "ic3a":               result.get("ic3a", False),
+        "ic3b":               result.get("ic3b", False),
+        "ic3c":               result.get("ic3c", False),
+        "ic3d":               result.get("ic3d", False),
+        "ic3e":               result.get("ic3e", False),
+        "exclusion_criterion":result.get("exclusion_criterion", ""),
+    })
+
+    all_rows = pd.concat([done_df, pd.DataFrame(new_rows)], ignore_index=True)
+    all_rows.to_csv(DECISIONS_CSV, index=False, encoding="utf-8-sig")
+    time.sleep(1)
+
+# ----------------------------------------------------------------
+# FINAL RESULTS
+# ----------------------------------------------------------------
+final = pd.concat([done_df, pd.DataFrame(new_rows)], ignore_index=True) \
+        if new_rows else done_df.copy()
+
+for col in ["decision","criterion","exclusion_reason","reasoning",
+            "key_evidence","ic2_note","title"]:
+    if col not in final.columns:
+        final[col] = ""
+    final[col] = final[col].fillna("").astype(str)
+
+# Normalize boolean columns
+for col in ["ic3a","ic3b","ic3c","ic3d","ic3e","ic2_semaglutide","ic1_met","ic3_design_ok"]:
+    if col in final.columns:
+        final[col] = final[col].astype(str).str.lower().isin(["true","1","yes"])
+
+inc = final[final["decision"] == "include"].copy()
+exc = final[final["decision"] == "exclude"].copy()
+err = final[~final["decision"].isin(["include","exclude"])].copy()
+
+n_tot = len(final)
+n_inc = len(inc)
+n_exc = len(exc)
+n_err = len(err)
+
+CRIT_LABELS = {
+    "IC":  "All criteria met - INCLUDED",
+    "IC1": "IC1 not met: not adult / animal population",
+    "IC2": "IC2 not met: semaglutide not studied",
+    "IC3": "IC3 not met: no perioperative outcome reported",
+    "EC1": "EC1: comorbidity management as primary focus",
+    "EC2": "EC2: contraindication to semaglutide focus",
+    "EC3": "EC3: other GLP-1 only, no semaglutide data",
+    "EC4": "EC4: not original research (review/editorial/case report)",
+    "EC5": "EC5: non-English language",
+    "EC6": "EC6: missing or insufficient outcome data",
+    "ERR": "Error: PDF unreadable",
+}
+
+print("\n" + "="*65)
+print("SCREENING COMPLETE")
+print("="*65)
+print("  Total    : " + str(n_tot))
+print("  Include  : " + str(n_inc))
+print("  Exclude  : " + str(n_exc))
+if n_err > 0:
+    print("  Errors   : " + str(n_err))
+    for _, r in err.iterrows():
+        print("    " + r["filename"] + ": " + str(r.get("exclusion_reason",""))[:60])
+
+crit_counts = Counter(exc["criterion"].tolist())
+print("\n  Exclusions by criterion:")
+for c in ["EC4","EC3","IC2","IC3","EC1","EC5","EC6","IC1"]:
+    n = crit_counts.get(c, 0)
+    if n:
+        print("    " + c + " (" + str(n) + "): " + CRIT_LABELS.get(c,""))
+
+print("\n  Included articles:")
+for i, (_, r) in enumerate(inc.iterrows(), 1):
+    domains = [d.upper() for d in ["ic3a","ic3b","ic3c","ic3d","ic3e"] if r.get(d) is True]
+    print("  " + str(i).rjust(2) + ". " + r["title"][:72])
+    print("      Domains : " + (", ".join(domains) if domains else "see reasoning"))
+    print("      Sema    : " + str(r.get("ic2_note",""))[:70])
+    print("      Reason  : " + str(r.get("reasoning",""))[:80])
+
+inc.to_csv(OUT_INCL, index=False, encoding="utf-8-sig")
+exc.to_csv(OUT_EXCL, index=False, encoding="utf-8-sig")
+print("\n  Saved: " + OUT_INCL)
+print("  Saved: " + OUT_EXCL)
+
+# ----------------------------------------------------------------
+# EXCLUSION CHART
+# ----------------------------------------------------------------
+if n_exc > 0:
+    chart = {CRIT_LABELS.get(c,c): n for c,n in crit_counts.items() if n > 0}
+    rs    = sorted(chart.items(), key=lambda x: -x[1])
+
+    fig, ax = plt.subplots(figsize=(11, max(3.5, len(rs)*0.7+1.5)))
+    fig.patch.set_facecolor("#FAFAFA")
+    ax.set_facecolor("#FAFAFA")
+    cmap = matplotlib.colormaps.get_cmap("tab10")
+    bars = ax.barh([x[0] for x in rs][::-1],
+                   [x[1] for x in rs][::-1],
+                   color=[cmap(j/max(len(rs),1)) for j in range(len(rs))],
+                   height=0.55, edgecolor="white")
+    for bar, (_, val) in zip(bars, rs[::-1]):
+        ax.text(bar.get_width()+0.05,
+                bar.get_y()+bar.get_height()/2,
+                str(val), va="center", fontsize=11, fontweight="bold")
+    ax.set_xlabel("Articles excluded", fontsize=11)
+    ax.set_title(
+        "Full-Text Exclusion Reasons - Claude AI Screening\n"
+        "(n = " + str(n_exc) + " excluded / " + str(n_tot) + " assessed)",
+        fontsize=12, fontweight="bold")
+    ax.set_xlim(0, max(x[1] for x in rs)+1.8)
+    for sp in ["top","right"]:
+        ax.spines[sp].set_visible(False)
+    ax.grid(axis="x", alpha=0.3)
+    plt.tight_layout()
+    p = os.path.join(OUT_DIR, "exclusion_reasons.png")
+    plt.savefig(p, dpi=300, bbox_inches="tight")
+    plt.close()
+    print("  Chart: " + p)
+
+# ----------------------------------------------------------------
+# PRISMA FLOW
+# ----------------------------------------------------------------
+excl_detail = "\n".join(
+    str(n) + "x  " + CRIT_LABELS.get(c,c)[:42]
+    for c,n in sorted(crit_counts.items(), key=lambda x:-x[1])[:6]
+)
+
+fig, ax = plt.subplots(figsize=(8, 10))
+fig.patch.set_facecolor("#FAFAFA")
+ax.set_facecolor("#FAFAFA")
+ax.axis("off")
+ax.set_xlim(0,10)
+ax.set_ylim(0,13)
+
+def box(ax, x, y, w, h, txt, col="#1565C0", fs=9.5, bg="#E3F2FD"):
+    ax.add_patch(mpatches.FancyBboxPatch(
+        (x-w/2, y-h/2), w, h,
+        boxstyle="round,pad=0.15",
+        facecolor=bg, edgecolor=col, linewidth=1.8, zorder=2))
+    ax.text(x, y, txt, ha="center", va="center", fontsize=fs,
+            color="#1A1A1A", zorder=3, multialignment="center", linespacing=1.5)
+
+def arr(ax, x, y1, y2):
+    ax.annotate("", xy=(x, y2+0.02), xytext=(x, y1-0.02),
+                arrowprops=dict(arrowstyle="-|>", color="#555", lw=1.5))
+
+box(ax, 5, 12.0, 5.5, 0.8,
+    "AI title/abstract screening\nn = " + str(n_tot) + " articles",
+    col="#1565C0", bg="#E3F2FD")
+arr(ax, 5, 11.6, 10.85)
+box(ax, 5, 10.45, 5.5, 0.75,
+    "Full-text articles assessed\nn = " + str(n_tot),
+    col="#6A1B9A", bg="#F3E5F5")
+
+ax.add_patch(mpatches.FancyBboxPatch(
+    (6.85, 7.8), 3.1, 2.8,
+    boxstyle="round,pad=0.1",
+    facecolor="#FDECEA", edgecolor="#C62828", linewidth=1.4, zorder=2))
+ax.text(8.4, 9.2,
+        "Excluded: n = " + str(n_exc) + "\n\n" + excl_detail,
+        ha="center", va="center", fontsize=7.5,
+        color="#5B0000", zorder=3, multialignment="left", linespacing=1.45)
+ax.annotate("", xy=(6.85, 10.45), xytext=(7.75, 10.45),
+            arrowprops=dict(arrowstyle="-|>", color="#C62828", lw=1.2))
+
+arr(ax, 5, 10.07, 9.2)
+box(ax, 5, 8.8, 5.5, 0.75,
+    "Studies included in final review\nn = " + str(n_inc),
+    col="#1B5E20", bg="#E8F5E9", fs=11)
+
+pct = (n_inc+n_exc)/n_tot if n_tot > 0 else 0
+ax.add_patch(mpatches.FancyBboxPatch(
+    (1.5, 7.5), 7*pct, 0.4,
+    boxstyle="round,pad=0.05",
+    facecolor="#1B5E20" if pct==1 else "#1565C0", alpha=0.75, zorder=2))
+ax.add_patch(mpatches.FancyBboxPatch(
+    (1.5, 7.5), 7, 0.4,
+    boxstyle="round,pad=0.05",
+    facecolor="none", edgecolor="#AAA", linewidth=1, zorder=3))
+ax.text(5, 7.72,
+        str(n_inc+n_exc) + "/" + str(n_tot) + " screened  ("
+        + str(round(pct*100)) + "%)",
+        ha="center", va="center", fontsize=9,
+        color="white" if pct > 0.3 else "#333",
+        fontweight="bold", zorder=4)
+
+ax.set_title(
+    "Full-Text Review - PRISMA Flow\nSemaglutide + Perioperative Outcomes",
+    fontsize=12, fontweight="bold", pad=10)
+plt.tight_layout()
+pf = os.path.join(OUT_DIR, "fulltext_prisma_flow.png")
+plt.savefig(pf, dpi=300, bbox_inches="tight")
+plt.close()
+print("  PRISMA flow: " + pf)
+
+# ----------------------------------------------------------------
+# SUMMARY TEXT
+# ----------------------------------------------------------------
+top3 = "; ".join(
+    str(n) + " (" + CRIT_LABELS.get(c,c).split(":")[0] + ")"
+    for c,n in sorted(crit_counts.items(), key=lambda x:-x[1])[:3]
+) if crit_counts else "not available"
+
+summary = (
+    "\n"
+    "==============================================================\n"
+    "FULL-TEXT REVIEW SUMMARY\n"
+    "Semaglutide + perioperative outcomes | Claude AI screening v3\n"
+    "==============================================================\n\n"
+    "INCLUSION CRITERIA\n"
+    "  IC1  Adults >= 18 years\n"
+    "  IC2  Preoperative semaglutide treatment (any duration)\n"
+    "  IC3  RCT or observational study reporting >=1 of:\n"
+    "         IC3a  Residual gastric content\n"
+    "         IC3b  Bronchial / pulmonary aspiration\n"
+    "         IC3c  Airway management complications\n"
+    "         IC3d  Semaglutide withdrawal / hold period\n"
+    "         IC3e  Overall perioperative complications\n\n"
+    "EXCLUSION CRITERIA\n"
+    "  EC1  Comorbidity management as primary focus\n"
+    "  EC2  Contraindication focus\n"
+    "  EC3  Other GLP-1 only - no semaglutide data\n"
+    "  EC4  Case report / series / review / editorial\n"
+    "  EC5  Non-English language\n"
+    "  EC6  Missing / insufficient outcome data\n\n"
+    "PRISMA NUMBERS\n"
+    "  Full-text assessed : " + str(n_tot) + "\n"
+    "  Excluded           : " + str(n_exc) + "\n"
+    "  Included           : " + str(n_inc) + "\n"
+    "  Errors             : " + str(n_err) + "\n\n"
+    "EXCLUSION BREAKDOWN\n"
+    + "\n".join("  " + str(n).rjust(3) + "  " + CRIT_LABELS.get(c,c)
+                for c,n in sorted(crit_counts.items(), key=lambda x:-x[1]))
+    + "\n\n"
+    "SUGGESTED RESULTS TEXT\n"
+    "  Full-text review was conducted on " + str(n_tot) + " articles.\n"
+    "  After applying predefined inclusion and exclusion criteria,\n"
+    "  " + str(n_exc) + " articles were excluded. Main exclusion reasons:\n"
+    "  " + top3 + ".\n"
+    "  A total of " + str(n_inc) + " studies met all inclusion criteria\n"
+    "  and were included in the final systematic review.\n\n"
+    "==============================================================\n"
+    "Files saved to: " + OUT_DIR + "\n"
+    "  full_text_decisions_claude.csv\n"
+    "  full_text_INCLUDED.csv\n"
+    "  full_text_EXCLUDED.csv\n"
+    "  exclusion_reasons.png\n"
+    "  fulltext_prisma_flow.png\n"
+    "  full_text_summary.txt\n"
+    "==============================================================\n"
+)
+print(summary)
+with open(OUT_SUMMARY, "w", encoding="utf-8") as f:
+    f.write(summary)
+
+print("=" * 65)
+print("DONE  |  " + str(n_inc) + " included  |  " + str(n_exc) + " excluded  |  " + str(n_err) + " errors")
+print("=" * 65)
+
