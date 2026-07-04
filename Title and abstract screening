@@ -1,0 +1,603 @@
+# ============================================================
+# PRISMA TITLE/ABSTRACT SCREENING — v4
+# Semaglutide + perioperative outcomes | Colab
+#
+# APPROACH: 3-gate rules (primary) + ML query similarity (secondary)
+#   Gate 1 — GLP-1 / semaglutide mention
+#   Gate 2 — Perioperative context
+#   Gate 3 — ≥1 of 5 IC3 outcome domains
+#
+#   ML model rescues borderline Gate-3 misses at very high threshold.
+#   Final decision is always binary: include / exclude.
+#
+# Outputs (Google Drive):
+#   1) AI_screening_ALL.csv
+#   2) AI_screening_INCLUDED.csv
+#   3) AI_screening_AUTO_EXCLUDED.csv
+#   4) PRISMA_FLOW.txt
+# ============================================================
+
+import os, re, sys, subprocess
+
+# -----------------------
+# 0) FIX ENV (Colab-safe pins)
+# -----------------------
+PINNED = {
+    "numpy": "1.26.4",
+    "pandas": "2.2.2",
+    "scipy": "1.13.1",
+    "scikit-learn": "1.5.2",
+}
+
+def get_ver(pkg):
+    try:
+        import importlib.metadata as md
+        return md.version(pkg)
+    except Exception:
+        return None
+
+need_fix = any(get_ver(p) != v for p, v in PINNED.items())
+if need_fix:
+    pkgs = [f"{p}=={v}" for p, v in PINNED.items()]
+    print("Fixing package versions...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
+                           "--upgrade", "--force-reinstall"] + pkgs)
+    print("Versions fixed. Restarting runtime...")
+    os.kill(os.getpid(), 9)
+
+# -----------------------
+# 1) Imports
+# -----------------------
+import numpy as np
+import pandas as pd
+from scipy.sparse import hstack, csr_matrix
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics.pairwise import cosine_similarity
+
+# -----------------------
+# 2) Mount Google Drive
+# -----------------------
+from google.colab import drive
+DRIVE_ROOT = "/content/drive"
+if not os.path.ismount(DRIVE_ROOT):
+    drive.mount(DRIVE_ROOT)
+else:
+    print("Drive already mounted")
+
+# -----------------------
+# 3) PATHS - EDITABLE
+# -----------------------
+OUT_DIR   = [PATH_REMOVED]
+os.makedirs(OUT_DIR, exist_ok=True)
+
+INPUT_CSV = os.path.join(OUT_DIR, "deduplicated.csv")
+OUT_ALL   = os.path.join(OUT_DIR, "AI_screening_ALL.csv")
+OUT_INCL  = os.path.join(OUT_DIR, "AI_screening_INCLUDED.csv")
+OUT_EXCL  = os.path.join(OUT_DIR, "AI_screening_AUTO_EXCLUDED.csv")
+OUT_PRIS  = os.path.join(OUT_DIR, "PRISMA_FLOW.txt")
+
+if not os.path.exists(INPUT_CSV):
+    raise FileNotFoundError(f"INPUT_CSV not found: {INPUT_CSV}")
+
+# ==============================================================
+# TUNING KNOBS
+#   MIN_OUTCOME_DOMAINS : raise to 2 if still too many results
+#   ML_RESCUE_THR       : probability threshold to rescue a record
+#                         that passed Gates 1+2 but failed Gate 3
+#                         Set 0.0 to disable ML rescue entirely
+# ==============================================================
+MIN_OUTCOME_DOMAINS = 1
+ML_RESCUE_THR       = 0.90
+
+# -----------------------
+# 4) HELPERS
+# -----------------------
+def norm_text(s):
+    s = "" if s is None or (isinstance(s, float) and np.isnan(s)) else str(s)
+    return re.sub(r"\s+", " ", s.lower().strip())
+
+def find_col(df, keys):
+    cols = {c.lower(): c for c in df.columns}
+    for k in keys:
+        if k.lower() in cols:
+            return cols[k.lower()]
+    for c in df.columns:
+        if any(k.lower() in c.lower() for k in keys):
+            return c
+    return None
+
+def any_match(text, patterns):
+    return any(re.search(p, text) for p in patterns)
+
+# -----------------------
+# 5) LOAD DATA
+# -----------------------
+df = pd.read_csv(INPUT_CSV)
+n_after_dedup = len(df)
+print(f"\nCSV loaded | {df.shape[0]} rows, {df.shape[1]} cols")
+
+title_col = find_col(df, ["title"])
+abs_col   = find_col(df, ["abstract", "summary", "abstract_note", "abstract note"])
+kw_col    = find_col(df, ["keywords", "keyword"])
+notes_col = find_col(df, ["notes", "note"])
+
+print(f"Columns → title: {title_col} | abstract: {abs_col} | "
+      f"keywords: {kw_col} | notes: {notes_col}")
+
+if title_col is None:
+    raise ValueError(f"No Title column found. Available: {list(df.columns)}")
+if abs_col is None:
+    df["_abstract_tmp"] = ""
+    abs_col = "_abstract_tmp"
+    print("WARNING: No abstract column — using empty strings.")
+
+def safe_col(c):
+    return df[c].astype(str) if c and (c in df.columns) else pd.Series([""] * len(df))
+
+n_missing_abstract = (
+    df[abs_col].isna().sum() +
+    (df[abs_col].astype(str).str.strip().isin(["", "nan"])).sum()
+)
+print(f"Records with missing/empty abstract: {n_missing_abstract}")
+
+df["_title_norm"]    = safe_col(title_col).apply(norm_text)
+df["_abstract_norm"] = safe_col(abs_col).apply(norm_text)
+df["_has_abstract"]  = (~df["_abstract_norm"].str.strip().isin(["", "nan"])).astype(int)
+
+df["_text"] = (
+    safe_col(title_col) + " " +
+    safe_col(abs_col)   + " " +
+    safe_col(kw_col)    + " " +
+    safe_col(notes_col)
+).apply(norm_text)
+
+# -----------------------
+# 6) TERM LISTS — protocol-mapped (EDITABLE - for other researchers)
+# -----------------------
+
+# ── GATE 1: GLP-1 / Semaglutide (IC2) ────────────────────────────────────
+# Includes semaglutide by name AND GLP-1 class terms.
+# Papers studying the GLP-1 class without naming semaglutide explicitly
+# are still relevant (semaglutide is a GLP-1 RA).
+# Specificity is enforced by Gates 2 and 3.
+SEMAGLUTIDE_TERMS = [
+    r"\bsemaglutide\b", r"\bozempic\b", r"\bwegovy\b", r"\brybelsus\b",
+    r"\bglp[- ]?1\b",
+    r"\bglp[- ]?1 receptor agonist\w*",
+    r"\bglucagon[- ]like peptide[- ]?1\b",
+    r"\bglucagon[- ]like peptide 1 receptor agonist\w*",
+    r"\bglp1[- ]?ra\b",
+    r"\bglp[- ]?1[- ]?ra\b",
+    r"\bincretin\w*",
+]
+
+# ── GATE 2: Perioperative context (IC3 header) ────────────────────────────
+PERIOP_TERMS = [
+    r"\bperioperat\w*", r"\bpreoperat\w*", r"\bintraoperat\w*", r"\bpostoperat\w*",
+    r"\bsurger\w*", r"\bsurgical\b", r"\boperative\b",
+    r"\banesth\w*", r"\banaesth\w*", r"\bsedat\w*",
+    r"\bendoscop\w*", r"\bcolonoscop\w*", r"\begd\b", r"\bgastroscop\w*",
+    r"\bintubat\w*", r"\bairway\b",
+    r"\bfasting\b", r"\bnpo\b", r"\bnil by mouth\b",
+    r"\blaparoscop\w*", r"\bbariatric\b",
+    r"\bprocedur\w*",
+]
+
+# ── GATE 3: Outcome domains IC3a–e ───────────────────────────────────────
+
+# IC3a – Residual gastric content
+# CORRECTED: "gastric emptying", "gastric volume", and "gastroparesis"
+# now require proximity to a perioperative term (within 80 chars).
+# Rationale: these terms appear heavily in diabetes pharmacology papers
+# (e.g. "gastric emptying rate", "fasting gastric volume") where they
+# describe metabolic endpoints, NOT perioperative safety.
+# "fasting" deliberately excluded from proximity trigger — it is
+# extremely common in diabetes abstracts as "fasting glucose/insulin".
+_PERIOP_PROX = r"(periop\w*|preoperat\w*|anesth\w*|surger\w*|intubat\w*|endoscop\w*|sedation|aspiration|npo|nil by mouth)"
+GASTRIC_TERMS = [
+    r"\bresidual gastric\b",        # always specific to periop safety
+    r"\bgastric content\b",         # always specific
+    r"\bstomach content\b",         # always specific
+    r"\bfull stomach\b",            # always specific
+    r"\bretained gastric\b",        # always specific
+    r"\bgastric ultrasound\b",      # always anesthesia context
+    r"\bgastric residual\b",        # always specific
+    # gastroparesis only when near periop terms
+    r"\bgastropar\w*.{0,80}" + _PERIOP_PROX,
+    _PERIOP_PROX + r".{0,80}\bgastropar\w*",
+    # gastric emptying only when near periop terms (not "fasting glucose")
+    r"\bgastric emptying\b.{0,80}" + _PERIOP_PROX,
+    _PERIOP_PROX + r".{0,80}\bgastric emptying\b",
+    # gastric volume only when near periop/ultrasound terms
+    r"\bgastric volume\b.{0,80}" + _PERIOP_PROX,
+    _PERIOP_PROX + r".{0,80}\bgastric volume\b",
+    r"\bgastric volume\b.{0,80}\bultrasound\b",
+    r"\bultrasound\b.{0,80}\bgastric volume\b",
+]
+
+# IC3b – Aspiration / regurgitation
+# "aspiration" alone excluded — too generic (needle aspiration, joint aspiration)
+ASPIRATION_TERMS = [
+    r"\bpulmonary aspiration\b",
+    r"\bbronchial aspiration\b",
+    r"\baspiration pneumonitis\b",
+    r"\baspiration pneumonia\b",
+    r"\bregurgitat\w*",
+    r"\bsilent aspiration\b",
+]
+
+# IC3c – Airway management complications
+AIRWAY_TERMS = [
+    r"\bdifficult intubat\w*",
+    r"\bdifficult airway\b",
+    r"\bfailed intubat\w*",
+    r"\bemergent intubat\w*",
+    r"\brapid sequence intubat\w*",
+    r"\brsi\b",
+    r"\bairway complication\w*",
+    r"\bairway management\b",
+    r"\blaryngospasm\b",
+    r"\bbronchospasm\b",
+]
+
+# IC3d – Semaglutide/GLP-1 withdrawal / hold period
+WITHDRAWAL_TERMS = [
+    r"\bpreoperative (hold|discontinu|withhold|cessation|suspension)\w*",
+    r"\bsemaglutide\b.{0,80}(withdr\w*|held|hold\w*|stop\w*|discontinu\w*|pause\w*|cessation|washout|suspend\w*)",
+    r"(withdr\w*|held|hold\w*|stop\w*|discontinu\w*|pause\w*|cessation|washout|suspend\w*).{0,80}\bsemaglutide\b",
+    r"\bglp[- ]?1\b.{0,80}(withdr\w*|discontinu\w*|hold|washout)",
+]
+
+# IC3e – Overall perioperative complications
+# CORRECTED: added "respiratory complication\w*" and "postoperative respiratory\b"
+# These patterns are needed to catch titles like:
+# "...Risk of Postoperative Respiratory Complications" (JAMA 2024, Dixit et al.)
+COMPLICATION_TERMS = [
+    r"\bperioperative complication\w*",
+    r"\bpostoperative complication\w*",
+    r"\bsurgical complication\w*",
+    r"\banesthetic complication\w*",
+    r"\bperioperative (outcome|risk|safety|adverse)\w*",
+    r"\bpostoperative (outcome|morbidity|mortality|adverse)\w*",
+    r"\badverse perioperative\b",
+    r"\bintraoperative (event|complication)\w*",
+    r"\brespiratory complication\w*",    # NEW: catches "postoperative respiratory complications"
+    r"\bpostoperative respiratory\b",    # NEW: catches "risk of postoperative respiratory..."
+]
+
+ALL_OUTCOME_DOMAINS = [
+    GASTRIC_TERMS,
+    ASPIRATION_TERMS,
+    AIRWAY_TERMS,
+    WITHDRAWAL_TERMS,
+    COMPLICATION_TERMS,
+]
+OUTCOME_DOMAIN_NAMES = [
+    "IC3a_gastric", "IC3b_aspiration", "IC3c_airway",
+    "IC3d_withdrawal", "IC3e_complication",
+]
+
+# ── HARD EXCLUSION RULES ─────────────────────────────────────────────────
+
+# EC4: Non-original study types
+NON_ORIGINAL_TERMS = [
+    r"\bsystematic review\b", r"\bmeta[- ]?analysis\b", r"\bmetaanalysis\b",
+    r"\bscoping review\b",    r"\bnarrative review\b",  r"\bliterature review\b",
+    r"\bguideline\b",         r"\bpractice guideline\b",
+    r"\bconsensus statement\b", r"\bconsensus\b",
+    r"\bcase report\b",       r"\bcase series\b",
+    r"\beditorial\b",         r"\bletter to the editor\b",
+    r"\bcommentary\b",        r"\bexpert opinion\b",    r"\bposition statement\b",
+]
+
+# EC3: Other specific GLP-1 agents — excluded ONLY if no semaglutide AND
+# no GLP-1 class term present (pure competitor-drug paper)
+OTHER_GLP1_TERMS = [
+    r"\bliraglutide\b", r"\bsaxenda\b",   r"\bvictoza\b",
+    r"\bdulaglutide\b", r"\btrulicity\b",
+    r"\bexenatide\b",   r"\bbyetta\b",    r"\bbydureon\b",
+    r"\blixisenatide\b", r"\badlyxin\b",
+    r"\btirzepatide\b", r"\bmounjaro\b",  r"\bzepbound\b",
+]
+
+# EC1 proxy: Pediatric / non-adult populations
+PEDIATRIC_TERMS = [
+    r"\bpediatric\b", r"\bpaediatric\b", r"\bchildren\b",
+    r"\badolescent\w*", r"\bneonate\w*", r"\binfant\w*", r"\bnewborn\b",
+]
+
+# Animal studies
+ANIMAL_TERMS = [
+    r"\bmouse\b", r"\bmice\b", r"\brat\b", r"\brats\b",
+    r"\bporcine\b", r"\bcanine\b", r"\bovine\b", r"\bmurine\b",
+    r"\banimal model\w*", r"\brodent\w*", r"\bin[- ]vivo\b",
+]
+
+# EC5: Non-English markers (conservative)
+NON_ENGLISH_TERMS = [
+    r"\bresumen\b", r"\bresumo\b", r"\bzusammenfassung\b", r"\brésumé\b",
+    r"\babstract.{0,20}(en español|em português|auf deutsch|en français)\b",
+]
+
+# -----------------------
+# 7) CLASSIFY EACH RECORD
+# -----------------------
+def classify(row):
+    text  = row["_text"]
+    title = row["_title_norm"]
+
+    # ── Gates ──
+    gate1 = any_match(text, SEMAGLUTIDE_TERMS)
+    gate2 = any_match(text, PERIOP_TERMS)
+    domain_hits = [any_match(text, d) for d in ALL_OUTCOME_DOMAINS]
+    n_domains   = sum(domain_hits)
+    gate3       = n_domains >= MIN_OUTCOME_DOMAINS
+
+    # ── Hard exclusion ──
+    ex_non_orig    = any_match(text, NON_ORIGINAL_TERMS)
+    ex_pediatric   = any_match(text, PEDIATRIC_TERMS)
+    ex_animal      = any_match(text, ANIMAL_TERMS)
+    ex_non_english = any_match(text, NON_ENGLISH_TERMS)
+
+    has_other_glp1    = any_match(text, OTHER_GLP1_TERMS)
+    has_sema_explicit = any_match(text, [r"\bsemaglutide\b", r"\bozempic\b",
+                                         r"\bwegovy\b",      r"\brybelsus\b"])
+    has_glp1_class    = any_match(text, [r"\bglp[- ]?1\b",
+                                         r"\bglucagon[- ]like peptide[- ]?1\b",
+                                         r"\bglp1[- ]?ra\b", r"\bglp[- ]?1[- ]?ra\b"])
+    # EC3: only exclude if competitor drug paper with NO semaglutide and NO GLP-1 class
+    ex_other_glp1_only = has_other_glp1 and (not has_sema_explicit) and (not has_glp1_class)
+
+    hard_exclude = ex_non_orig or ex_animal or ex_pediatric or ex_other_glp1_only
+
+    # Exclusion reasons — mapped to protocol criteria for audit trail
+    reasons = []
+    if ex_non_orig:        reasons.append("EC4:non_original")
+    if ex_animal:          reasons.append("animal_study")
+    if ex_pediatric:       reasons.append("EC1_proxy:pediatric")
+    if ex_other_glp1_only: reasons.append("EC3:other_GLP1_only")
+    if ex_non_english:     reasons.append("EC5:non_english_marker")
+    if not gate1:          reasons.append("no_GLP1_semaglutide_term")
+    if not gate2:          reasons.append("no_periop_context")
+    if not gate3:          reasons.append("no_outcome_domain")
+
+    # Primary decision — strict binary, no uncertain category
+    if gate1 and gate2 and gate3 and not hard_exclude:
+        decision = "include"
+    else:
+        decision = "exclude"
+
+    return {
+        "gate1_glp1":            int(gate1),
+        "gate2_periop":          int(gate2),
+        "gate3_outcome":         int(gate3),
+        "n_outcome_domains":     n_domains,
+        **{OUTCOME_DOMAIN_NAMES[i]: int(domain_hits[i]) for i in range(5)},
+        "sema_in_title":         int(any_match(title, SEMAGLUTIDE_TERMS)),
+        "ex_non_original":       int(ex_non_orig),
+        "ex_pediatric":          int(ex_pediatric),
+        "ex_animal":             int(ex_animal),
+        "ex_other_glp1_only":    int(ex_other_glp1_only),
+        "ex_non_english":        int(ex_non_english),
+        "flag_missing_abstract": int(not row["_has_abstract"]),
+        "exclusion_reasons":     ";".join(reasons),
+        "rule_decision":         decision,
+    }
+
+print("\nApplying 3-gate rules...")
+results = df.apply(classify, axis=1).apply(pd.Series)
+df = pd.concat([df, results], axis=1)
+
+print("Rule-based decisions:")
+print(df["rule_decision"].value_counts())
+
+# -----------------------
+# 8) ML MODEL (secondary — rescues borderline Gate-3 misses only)
+#
+# Uses word TF-IDF + character TF-IDF (catches morphological variants)
+# + cosine similarity to the structured query.
+# Trained on rule-includes (positive) vs clear non-GLP1/non-periop (negative).
+# Only applied to records that passed Gates 1+2 but failed Gate 3,
+# and only at a very high confidence threshold (ML_RESCUE_THR).
+# -----------------------
+QUERY_TEXT = """
+(glucagon-like peptide-1 OR GLP-1 OR GLP1 OR GLP1-RA OR semaglutide OR ozempic OR wegovy OR rybelsus)
+(endoscopy OR upper endoscopy OR EGD OR gastroscopy OR colonoscopy OR sedation OR anesthesia OR surgery OR perioperative)
+(residual gastric content OR retained gastric OR gastric emptying OR gastric volume OR aspiration OR regurgitation OR pneumonia OR respiratory complications)
+(withholding OR discontinuation OR hold OR suspension OR cessation OR washout)
+""".strip()
+
+query = norm_text(QUERY_TEXT)
+
+# Word TF-IDF
+vec_word = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_df=0.90,
+                            sublinear_tf=True, stop_words="english")
+Xw = vec_word.fit_transform(df["_text"].values)
+qw = vec_word.transform([query])
+sim_word = cosine_similarity(Xw, qw).ravel()
+
+# Character TF-IDF (catches morphological variants, abbreviations)
+vec_char = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5),
+                            min_df=2, max_df=0.95)
+Xc = vec_char.fit_transform(df["_text"].values)
+qc = vec_char.transform([query])
+sim_char = cosine_similarity(Xc, qc).ravel()
+
+df["sim_query"] = np.maximum(sim_word, sim_char)
+
+# Weak labels: rule-includes = positive, clear non-GLP1 or non-periop = negative
+train_pos = df[df["rule_decision"] == "include"]
+train_neg = df[(df["gate1_glp1"] == 0) | (df["gate2_periop"] == 0)]
+train_neg = train_neg.sample(
+    n=min(len(train_neg), len(train_pos) * 3),
+    random_state=42
+)
+train_df = pd.concat([train_pos.assign(_wl=1), train_neg.assign(_wl=0)])
+
+USE_MODEL = len(train_df) >= 50
+if USE_MODEL:
+    Xw_tr = vec_word.transform(train_df["_text"].values)
+    Xc_tr = vec_char.transform(train_df["_text"].values)
+    X_tr  = hstack([Xw_tr, Xc_tr,
+                    csr_matrix(train_df["sim_query"].values.reshape(-1, 1))],
+                   format="csr")
+    clf = LogisticRegression(max_iter=4000, class_weight="balanced",
+                              C=0.5, random_state=42, n_jobs=-1)
+    clf.fit(X_tr, train_df["_wl"].astype(int).values)
+
+    X_all = hstack([Xw, Xc,
+                    csr_matrix(df["sim_query"].values.reshape(-1, 1))],
+                   format="csr")
+    df["p_include_model"] = clf.predict_proba(X_all)[:, 1]
+    print(f"\nModel trained | pos={len(train_pos)} neg={len(train_neg)}")
+    print(df["p_include_model"].describe(percentiles=[0.50, 0.75, 0.90, 0.95, 0.99]))
+else:
+    df["p_include_model"] = np.nan
+    print("Skipping ML — insufficient training data.")
+
+# -----------------------
+# 9) FINAL DECISION
+#    Rules are primary. ML only rescues records that:
+#      - Passed Gate 1 (GLP-1 term) ✓
+#      - Passed Gate 2 (periop context) ✓
+#      - Failed Gate 3 (no outcome domain matched) ✗
+#      - Pass no hard-exclusion rule
+#      - Have model probability ≥ ML_RESCUE_THR
+# -----------------------
+df["ai_decision"] = df["rule_decision"]
+
+if USE_MODEL and ML_RESCUE_THR > 0:
+    rescue_mask = (
+        (df["rule_decision"]      == "exclude") &
+        (df["gate1_glp1"]         == 1) &
+        (df["gate2_periop"]       == 1) &
+        (df["ex_non_original"]    == 0) &
+        (df["ex_animal"]          == 0) &
+        (df["ex_pediatric"]       == 0) &
+        (df["ex_other_glp1_only"] == 0) &
+        (df["p_include_model"]    >= ML_RESCUE_THR)
+    )
+    df.loc[rescue_mask, "ai_decision"] = "include"
+    df.loc[rescue_mask, "exclusion_reasons"] = (
+        df.loc[rescue_mask, "exclusion_reasons"] + ";rescued_by_ML"
+    )
+    print(f"\nML rescued {int(rescue_mask.sum())} records (threshold p≥{ML_RESCUE_THR})")
+
+print("\nFinal decisions:")
+print(df["ai_decision"].value_counts())
+
+# -----------------------
+# 10) PRISMA FLOW
+# -----------------------
+n_include = int((df["ai_decision"] == "include").sum())
+n_exclude = int((df["ai_decision"] == "exclude").sum())
+excl_tmp  = df[df["ai_decision"] == "exclude"]
+
+def ce(col):
+    return int((excl_tmp[col] == 1).sum()) if col in excl_tmp.columns else 0
+
+n_no_sema    = int((excl_tmp["gate1_glp1"] == 0).sum())
+n_no_periop  = int(((excl_tmp["gate1_glp1"] == 1) &
+                    (excl_tmp["gate2_periop"] == 0)).sum())
+n_no_outcome = int(((excl_tmp["gate1_glp1"] == 1) &
+                    (excl_tmp["gate2_periop"] == 1) &
+                    (excl_tmp["gate3_outcome"] == 0)).sum())
+
+prisma_text = f"""
+==============================================================
+PRISMA FLOW — Title/Abstract Screening (AI-assisted v4)
+==============================================================
+
+Records after deduplication:                {n_after_dedup}
+  of which missing/empty abstract:          {n_missing_abstract}
+
+── Screening logic ───────────────────────────────────────────
+  Primary:   3-gate rule (ALL gates required)
+  Secondary: ML rescue at p≥{ML_RESCUE_THR} (Gate 1+2 pass, Gate 3 miss only)
+
+  Gate 1 — GLP-1 / semaglutide mention (IC2)
+  Gate 2 — Perioperative context (IC3 header)
+  Gate 3 — ≥{MIN_OUTCOME_DOMAINS} of 5 IC3 outcome domain(s):
+           IC3a: residual gastric content
+           IC3b: aspiration / regurgitation
+           IC3c: airway management complications
+           IC3d: GLP-1/semaglutide withdrawal period
+           IC3e: perioperative / respiratory complications
+
+  Any gate failure OR hard exclusion rule → EXCLUDED
+  No uncertain category — binary include/exclude only.
+
+Title/Abstract Screening:
+  ├── INCLUDED : {n_include}
+  └── EXCLUDED : {n_exclude}
+
+Records forwarded to full-text review: {n_include}
+
+──────────────────────────────────────────────────────────────
+Exclusion breakdown:
+
+  No GLP-1/semaglutide term  [Gate 1 fail]: {n_no_sema}
+  No perioperative context   [Gate 2 fail]: {n_no_periop}
+  No outcome domain          [Gate 3 fail]: {n_no_outcome}
+
+  EC4 – Non-original study type:            {ce("ex_non_original")}
+       (reviews, meta-analyses, guidelines,
+        editorials, case reports/series)
+  EC3 – Other GLP-1 only (no semaglutide):  {ce("ex_other_glp1_only")}
+  EC1 proxy – Pediatric population:         {ce("ex_pediatric")}
+  Animal studies:                           {ce("ex_animal")}
+  EC5 – Non-English markers:                {ce("ex_non_english")}
+
+Note: one record can match multiple reasons.
+
+==============================================================
+FOR YOUR PRISMA FLOWCHART:
+  "Records screened"                  = {n_after_dedup}
+  "Records excluded (title/abstract)" = {n_exclude}
+  "Full-text articles assessed"       = {n_include}
+==============================================================
+"""
+print(prisma_text)
+with open(OUT_PRIS, "w", encoding="utf-8") as f:
+    f.write(prisma_text)
+print(f"PRISMA flow saved: {OUT_PRIS}")
+
+# -----------------------
+# 11) EXPORT CSVs
+# -----------------------
+drop_cols = ["_text", "_title_norm", "_abstract_norm", "_abstract_tmp",
+             "_has_abstract", "rule_decision", "_wl"]
+out_df  = df.drop(columns=drop_cols, errors="ignore").copy()
+incl_df = out_df[out_df["ai_decision"] == "include"].copy()
+excl_df = out_df[out_df["ai_decision"] == "exclude"].copy()
+
+out_df.to_csv(OUT_ALL,  index=False, encoding="utf-8-sig")
+incl_df.to_csv(OUT_INCL, index=False, encoding="utf-8-sig")
+excl_df.to_csv(OUT_EXCL, index=False, encoding="utf-8-sig")
+
+print(f"\nFiles saved:")
+print(f"  ALL      : {len(out_df):>5} rows → {OUT_ALL}")
+print(f"  INCLUDED : {len(incl_df):>5} rows → {OUT_INCL}")
+print(f"  EXCLUDED : {len(excl_df):>5} rows → {OUT_EXCL}")
+
+# -----------------------
+# 12) SANITY PREVIEW
+# -----------------------
+tcol = title_col if title_col in incl_df.columns else "title"
+
+print(f"\n── INCLUDED sample (first 15) ──")
+for i, (_, row) in enumerate(incl_df.head(15).iterrows()):
+    domains  = [OUTCOME_DOMAIN_NAMES[j] for j in range(5) if row.get(OUTCOME_DOMAIN_NAMES[j], 0) == 1]
+    rescued  = "ML" if "rescued_by_ML" in str(row.get("exclusion_reasons","")) else ""
+    p        = row.get("p_include_model", float("nan"))
+    print(f"  [{i+1}] {str(row.get(tcol,''))[:80]}{rescued}")
+    print(f"       domains: {', '.join(domains) or 'none'} | p={p:.2f}")
+
+print(f"\n── EXCLUDED sample (first 10) ──")
+for i, (_, row) in enumerate(excl_df.head(10).iterrows()):
+    print(f"  [{i+1}] {str(row.get(tcol,''))[:80]}")
+    print(f"       reasons: {row.get('exclusion_reasons','')}")
+
+print(f"\nDone. {n_include} included | {n_exclude} excluded")
+print(f"Forwarded to full-text review: {n_include} records")
