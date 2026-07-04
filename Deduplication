@@ -1,1 +1,401 @@
+# ============================================================
+#  SysRev Deduplicator — v3
+#
+#   - Year guard on title fuzzy: skip if both records have a year
+#    and they differ by more than 1 (cuts FP on unrelated papers
+#    with similar titles from different years)
+#  - Author guard on title/abstract fuzzy: skip if both records
+#    have a first author and they don't match (cuts FP on papers
+#    with same title by different authors)
+#  - Stronger completeness scoring: abstract and journal/vol/pages
+#    carry more weight so the "better" record is kept more
+# ============================================================
+
+# ── CELL 1 · Install ────────────────────────────────────────
+!pip -q install pandas rapidfuzz tqdm
+
+# ── CELL 2 · Mount Drive and set paths ────────────────────────
+import os
+from google.colab import drive
+
+DRIVE_ROOT = "/content/drive"
+if not os.path.ismount(DRIVE_ROOT):
+    drive.mount(DRIVE_ROOT)
+else:
+    print("Drive already mounted")
+
+# ▼▼▼  EDITABLE ▼▼▼
+OUT_DIR   = [PATH_REMOVED]
+INPUT_CSV = os.path.join(OUT_DIR, "r_articles_16159.csv")
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+OUT_DEDUP = os.path.join(OUT_DIR, "deduplicated.csv")
+OUT_DUPS  = os.path.join(OUT_DIR, "duplicates_removed.csv")
+OUT_PAIRS = os.path.join(OUT_DIR, "duplicate_pairs.csv")
+
+os.makedirs(OUT_DIR, exist_ok=True)
+print("INPUT exists:", os.path.exists(INPUT_CSV))
+
+# ── CELL 3 · Thresholds EDITABLE (edit here to tune) ─────────────────
+TITLE_THR      = 97    # token-sort-ratio threshold for title fuzzy match (0-100)
+ABS_THR        = 95    # character ratio threshold for abstract fuzzy match (0-100)
+ABS_MIN_LEN    = 150   # ignore abstracts shorter than this (chars)
+ABS_PREFIX_LEN = 80    # blocking prefix length for abstract grouping
+
+CHECK_DOI      = True
+CHECK_PMID     = True
+CHECK_ABSTRACT = True
+CHECK_TITLE    = True
+
+# ── Year / author guards on fuzzy matching ───────────────────
+# When both records have a year, skip the match if they differ
+# by more than this value. Set to None to disable.
+YEAR_TOLERANCE = 1     # allow ±1 year (handles preprint → journal)
+
+# When both records have a first author, require them to match.
+# Set to False to disable.
+AUTHOR_GUARD   = True
+
+# ── CELL 4 · Load & inspect ─────────────────────────────────
+import pandas as pd
+import numpy as np
+
+encodings_to_try = [
+    "utf-8-sig",
+    "utf-8",
+    "cp1252",
+    "latin1",
+    "ISO-8859-1"
+]
+
+df = None
+used_encoding = None
+
+for enc in encodings_to_try:
+    try:
+        df = pd.read_csv(INPUT_CSV, low_memory=False, encoding=enc)
+        used_encoding = enc
+        print(f"CSV loaded successfully with encoding: {enc}")
+        break
+    except UnicodeDecodeError as e:
+        print(f"Failed with encoding {enc}: {e}")
+
+if df is None:
+    raise ValueError("Could not read CSV with the tested encodings.")
+
+print(f"Shape: {df.shape}")
+print("Columns:", list(df.columns))
+df.head(3)
+
+# ── CELL 5 · Deduplication ──────────────────────────────────
+import re
+from rapidfuzz import fuzz
+from tqdm.auto import tqdm
+
+# ── helpers ──────────────────────────────────────────────────
+
+def norm_text(s):
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return ""
+    return re.sub(r"\s+", " ", str(s).lower().strip())
+
+def norm_title(s):
+    s = norm_text(s)
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", s)).strip()
+
+def norm_abstract(s):
+    s = norm_text(s)
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", s)).strip()
+
+def norm_doi(s):
+    s = norm_text(s)
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        s = s.replace(prefix, "")
+    m = re.search(r"(10\.\d{4,9}/\S+)", s)
+    return m.group(1).rstrip(" .);,") if m else ""
+
+def norm_pmid(s):
+    s = norm_text(s)
+    m = re.search(r"\b(\d{6,10})\b", s)
+    return m.group(1) if m else ""
+
+def norm_year(s):
+    s = norm_text(s)
+    m = re.search(r"\b(19|20)\d{2}\b", s)
+    return m.group(0) if m else ""
+
+def first_author_key(s):
+    s = norm_text(s)
+    if s.strip() in ("", "nan", "none"):
+        return ""
+    s = re.sub(r"[^a-z\s,;]", "", s)
+    parts = re.split(r"[,;]", s)
+    tokens = parts[0].strip().split()
+    return tokens[-1] if tokens else ""
+
+def find_col(df, keys):
+    lc = {c.lower(): c for c in df.columns}
+    for k in keys:
+        if k in lc:
+            return lc[k]
+    for c in df.columns:
+        if any(k in c.lower() for k in keys):
+            return c
+    return None
+
+def years_compatible(ya, yb):
+    """Return True if years are compatible (same, missing, or within tolerance)."""
+    if YEAR_TOLERANCE is None:
+        return True
+    if not ya or not yb:
+        return True   # one missing → don't penalise
+    try:
+        return abs(int(ya) - int(yb)) <= YEAR_TOLERANCE
+    except ValueError:
+        return True
+
+def authors_compatible(aa, ab):
+    """Return True if first-author keys are compatible."""
+    if not AUTHOR_GUARD:
+        return True
+    if not aa or not ab:
+        return True   # one missing → don't penalise
+    return aa == ab
+
+# ── detect columns ───────────────────────────────────────────
+
+title_col   = find_col(df, ["title"])
+doi_col     = find_col(df, ["doi"])
+pmid_col    = find_col(df, ["pmid", "pubmed_id", "pubmedid", "pubmed id"])
+pmc_col     = find_col(df, ["pmc_id", "pmcid", "pmc id"])
+year_col    = find_col(df, ["year", "publication_year", "pubyear"])
+auth_col    = find_col(df, ["authors", "author"])
+abs_col     = find_col(df, ["abstract", "abstract note", "abstract_note", "summary"])
+journal_col = find_col(df, ["journal", "source", "publication", "container-title"])
+pages_col   = find_col(df, ["pages", "page"])
+vol_col     = find_col(df, ["volume"])
+iss_col     = find_col(df, ["issue", "number"])
+
+print("\nDetected columns:")
+for name, col in [("title", title_col), ("doi", doi_col), ("pmid", pmid_col),
+                   ("pmcid", pmc_col), ("year", year_col), ("authors", auth_col),
+                   ("abstract", abs_col), ("journal", journal_col)]:
+    print(f"  {name:10s}: {col}")
+
+if title_col is None:
+    raise ValueError("Title column not found — check your CSV headers above.")
+
+# ── normalise ────────────────────────────────────────────────
+
+d = df.copy()
+d["_idx"]        = range(len(d))
+d["_title_norm"] = d[title_col].astype(str).apply(norm_title)
+d["_doi"]        = d[doi_col].astype(str).apply(norm_doi)      if doi_col  else ""
+d["_pmid"]       = d[pmid_col].astype(str).apply(norm_pmid)    if pmid_col else ""
+d["_pmc"]        = d[pmc_col].astype(str).apply(norm_pmid)     if pmc_col  else ""
+d["_abs_norm"]   = d[abs_col].astype(str).apply(norm_abstract) if abs_col  else ""
+d["_year"]       = d[year_col].astype(str).apply(norm_year)    if year_col else ""
+d["_auth_key"]   = d[auth_col].astype(str).apply(first_author_key) if auth_col else ""
+
+# ── reply / letter / erratum guard ───────────────────────────
+# Titles ending with these words are distinct article types and
+# must never be merged with the original article.
+REPLY_SUFFIXES = r"[\-\s]*(reply|comment|letter|erratum|correction|editorial|response|rejoinder)\s*$"
+d["_is_reply"] = d["_title_norm"].str.contains(REPLY_SUFFIXES, regex=True, na=False)
+print(f"  Reply/letter/erratum records flagged: {d['_is_reply'].sum()}")
+
+# ── completeness score (prefer the most complete record) ─────
+# Higher weights for fields most useful for downstream screening
+
+score_cols = [c for c in [title_col, doi_col, pmid_col, pmc_col, year_col,
+                           auth_col, abs_col, journal_col, pages_col, vol_col, iss_col] if c]
+
+def completeness(row):
+    s = sum(1 for c in score_cols
+            if pd.notna(row.get(c)) and str(row.get(c, "")).strip()
+            and str(row.get(c, "")).lower() not in ("nan", "none", ""))
+    # Bonus for high-value identifiers
+    s += 4 * bool(row.get("_doi"))
+    s += 3 * bool(row.get("_pmid"))
+    s += 1 * bool(row.get("_pmc"))
+    # Bonus for long abstract (more useful for screening)
+    abs_len = len(str(row.get("_abs_norm", "")))
+    if abs_len >= 200: s += 3
+    elif abs_len >= 50: s += 1
+    # Bonus for having journal + volume + pages (full bibliographic record)
+    has_journal = journal_col and pd.notna(row.get(journal_col)) and str(row.get(journal_col, "")).strip() not in ("", "nan")
+    has_vol     = vol_col and pd.notna(row.get(vol_col)) and str(row.get(vol_col, "")).strip() not in ("", "nan")
+    has_pages   = pages_col and pd.notna(row.get(pages_col)) and str(row.get(pages_col, "")).strip() not in ("", "nan")
+    s += 2 * (has_journal and has_vol and has_pages)
+    return s
+
+d["_score"] = d.apply(completeness, axis=1)
+
+# ── Union-Find ───────────────────────────────────────────────
+
+class UnionFind:
+    def __init__(self, n):
+        self.p = list(range(n)); self.r = [0] * n
+    def find(self, x):
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]; x = self.p[x]
+        return x
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb: return
+        if   self.r[ra] < self.r[rb]: self.p[ra] = rb
+        elif self.r[ra] > self.r[rb]: self.p[rb] = ra
+        else: self.p[rb] = ra; self.r[ra] += 1
+
+uf    = UnionFind(len(d))
+pairs = []   # list of (idx_a, idx_b, match_type, similarity)
+
+def link_exact(col, label):
+    groups = d[d[col] != ""].groupby(col)["_idx"].apply(list)
+    for _, idxs in groups.items():
+        if len(idxs) < 2: continue
+        for j in idxs[1:]:
+            uf.union(idxs[0], j)
+            pairs.append((idxs[0], j, label, 100))
+
+# ── exact ID matches ─────────────────────────────────────────
+
+if CHECK_DOI:  link_exact("_doi",  "DOI_EXACT")
+if CHECK_PMID: link_exact("_pmid", "PMID_EXACT")
+link_exact("_pmc", "PMCID_EXACT")
+
+# ── year + first-author + title exact ────────────────────────
+# Catches same paper from different databases when DOI/PMID missing.
+# Uses full title norm (not just first 40 chars) to avoid false merges
+# on numbered series (WP1 vs WP2, Part I vs Part II, etc.)
+d["_yat"] = d["_year"] + "|" + d["_auth_key"] + "|" + d["_title_norm"]
+_yat_valid = (d["_year"].ne("") & d["_auth_key"].ne("") &
+              d["_title_norm"].str.len().gt(20))
+link_exact_mask = d[_yat_valid].groupby("_yat")["_idx"].apply(list)
+for _, idxs in link_exact_mask.items():
+    if len(idxs) < 2: continue
+    for j in idxs[1:]:
+        uf.union(idxs[0], j)
+        pairs.append((idxs[0], j, "YEAR_AUTHOR_TITLE_EXACT", 100))
+
+# ── abstract fuzzy (all-pairs within prefix block) ───────────
+# Guards: year must be compatible, author must match if both present
+if CHECK_ABSTRACT and abs_col:
+    d["_abs_pref"] = d["_abs_norm"].str[:ABS_PREFIX_LEN]
+    blocks = d[d["_abs_norm"].str.len() >= ABS_MIN_LEN].groupby("_abs_pref", dropna=False)
+    for _, g in tqdm(blocks, desc="Abstract blocks"):
+        idxs  = g["_idx"].tolist()
+        abss  = g["_abs_norm"].tolist()
+        years = g["_year"].tolist()
+        auths = g["_auth_key"].tolist()
+        for i in range(len(idxs)):
+            for j in range(i + 1, len(idxs)):
+                if not years_compatible(years[i], years[j]):
+                    continue
+                if not authors_compatible(auths[i], auths[j]):
+                    continue
+                sim = fuzz.ratio(abss[i], abss[j])
+                if sim >= ABS_THR:
+                    uf.union(idxs[i], idxs[j])
+                    pairs.append((idxs[i], idxs[j], f"ABSTRACT_FUZZY_{ABS_THR}", sim))
+
+# ── title fuzzy (all-pairs within prefix block) ──────────────
+# Uses token_sort_ratio only — preserves extra words like "Reply".
+# Guards: reply type must match, year must be compatible,
+#         author must match if both present.
+if CHECK_TITLE:
+    d["_title_pref"] = d["_title_norm"].str[:20]
+    title_blocks = d[d["_title_norm"].str.len() > 10].groupby("_title_pref", dropna=False)
+    for _, g in tqdm(title_blocks, desc="Title blocks"):
+        idxs     = g["_idx"].tolist()
+        titles   = g["_title_norm"].tolist()
+        is_reply = g["_is_reply"].tolist()
+        years    = g["_year"].tolist()
+        auths    = g["_auth_key"].tolist()
+        for i in range(len(idxs)):
+            for j in range(i + 1, len(idxs)):
+                # Never merge a reply/letter with a non-reply record
+                if is_reply[i] != is_reply[j]:
+                    continue
+                if not years_compatible(years[i], years[j]):
+                    continue
+                if not authors_compatible(auths[i], auths[j]):
+                    continue
+                sim = fuzz.token_sort_ratio(titles[i], titles[j])
+                if sim >= TITLE_THR:
+                    uf.union(idxs[i], idxs[j])
+                    pairs.append((idxs[i], idxs[j], f"TITLE_FUZZY_{TITLE_THR}", sim))
+
+# ── select best record per cluster ───────────────────────────
+
+d["_cluster"] = d["_idx"].apply(uf.find)
+d_sorted = d.sort_values(["_cluster", "_score"], ascending=[True, False])
+keep_idx = set(d_sorted.groupby("_cluster")["_idx"].first().values)
+
+# ── label each duplicate with the strongest removal reason ───
+
+reason_rank = {
+    "DOI_EXACT": 7, "PMID_EXACT": 6, "PMCID_EXACT": 5,
+    "YEAR_AUTHOR_TITLE_EXACT": 4,
+    f"ABSTRACT_FUZZY_{ABS_THR}": 3,
+    f"TITLE_FUZZY_{TITLE_THR}": 2,
+    "CLUSTER_DUPLICATE": 1,
+}
+
+pairs_df = pd.DataFrame(pairs, columns=["idx_a", "idx_b", "match_type", "similarity"])
+best_reason = {}
+for _, row in pairs_df.iterrows():
+    removed = row.idx_b if row.idx_a in keep_idx else (row.idx_a if row.idx_b in keep_idx else None)
+    if removed is None: continue
+    cur = best_reason.get(removed)
+    if cur is None or reason_rank.get(row.match_type, 0) > reason_rank.get(cur["type"], 0):
+        best_reason[removed] = {"type": row.match_type, "sim": row.similarity}
+
+# ── build output dataframes ───────────────────────────────────
+
+internal = [c for c in d.columns if c.startswith("_")]
+keep_mask  = d["_idx"].isin(keep_idx)
+dedup      = d[keep_mask].drop(columns=internal)
+duplicates = d[~keep_mask].drop(columns=internal).copy()
+duplicates["dup_reason"]     = duplicates.index.map(
+    lambda i: best_reason.get(d.loc[i, "_idx"], {}).get("type", "CLUSTER_DUPLICATE"))
+duplicates["dup_similarity"] = duplicates.index.map(
+    lambda i: best_reason.get(d.loc[i, "_idx"], {}).get("sim", ""))
+
+# ── report ───────────────────────────────────────────────────
+
+print("\n" + "=" * 50)
+print(f"  Total input records  : {len(d):>7,}")
+print(f"  Unique (kept)        : {len(dedup):>7,}")
+print(f"  Duplicates removed   : {len(duplicates):>7,}  ({len(duplicates)/len(d)*100:.1f}%)")
+print("=" * 50)
+print("\nRemoval reasons:")
+print(duplicates["dup_reason"].value_counts().to_string())
+
+# ── save ─────────────────────────────────────────────────────
+
+dedup.to_csv(OUT_DEDUP,  index=False, encoding="utf-8-sig")
+duplicates.to_csv(OUT_DUPS, index=False, encoding="utf-8-sig")
+pairs_df.to_csv(OUT_PAIRS, index=False, encoding="utf-8-sig")
+
+print(f"\nSaved to Drive:")
+print(f"  {OUT_DEDUP}")
+print(f"  {OUT_DUPS}")
+print(f"  {OUT_PAIRS}")
+
+# ── CELL 6 · Spot-check: review sample pairs ────────────────
+import textwrap
+
+title_col_local = title_col
+
+print(f"Showing 20 sample duplicate pairs\n{'─' * 70}")
+sample = pairs_df.sample(min(20, len(pairs_df)), random_state=42)
+for _, row in sample.iterrows():
+    ia, ib = int(row.idx_a), int(row.idx_b)
+    ta = df.iloc[ia][title_col_local] if title_col_local else "(no title)"
+    tb = df.iloc[ib][title_col_local] if title_col_local else "(no title)"
+    print(f"[{row.match_type}  sim={row.similarity:.0f}]")
+    print(f"  A: {textwrap.shorten(str(ta), 90)}")
+    print(f"  B: {textwrap.shorten(str(tb), 90)}")
+    print()
 
